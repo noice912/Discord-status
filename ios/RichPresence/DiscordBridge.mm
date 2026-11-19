@@ -40,13 +40,20 @@ static NSString *ns(const std::string &s) { return [NSString stringWithUTF8Strin
 
 - (void)log:(NSString *)m { if (self.onLog) self.onLog(m); }
 
+- (void)authFailed:(const std::string &)reason { if (self.onAuthFailed) self.onAuthFailed(ns(reason)); }
+
 - (void)signInWithType:(discordpp::AuthorizationTokenType)type token:(const std::string &)token {
     __weak DiscordBridge *weakSelf = self;
     _client->UpdateToken(type, token, [weakSelf](discordpp::ClientResult r) {
         DiscordBridge *me = weakSelf;
         if (!me) return;
-        if (!r.Successful()) { [me log:[@"Couldn't use the saved sign-in: " stringByAppendingString:ns(r.Error())]]; return; }
-        me->_client->Connect();
+        if (!r.Successful()) {
+            [me log:[@"Couldn't use the saved sign-in: " stringByAppendingString:ns(r.Error())]];
+            [me authFailed:r.Error()];
+            return;
+        }
+        // a token renewed while already signed in is picked up by the open connection
+        if (me->_client->GetStatus() != discordpp::Client::Status::Ready) me->_client->Connect();
     });
 }
 
@@ -56,7 +63,11 @@ static NSString *ns(const std::string &s) { return [NSString stringWithUTF8Strin
                       discordpp::AuthorizationTokenType type, int32_t expiresIn, std::string) {
         DiscordBridge *me = weakSelf;
         if (!me) return;
-        if (!r.Successful()) { [me log:[@"Discord refused the sign-in: " stringByAppendingString:ns(r.Error())]]; return; }
+        if (!r.Successful()) {
+            [me log:[@"Discord refused the sign-in: " stringByAppendingString:ns(r.Error())]];
+            [me authFailed:r.Error()];
+            return;
+        }
         if (me.onTokens) me.onTokens(ns(access), ns(refresh), expiresIn);
         [me signInWithType:type token:access];
     };
@@ -72,7 +83,11 @@ static NSString *ns(const std::string &s) { return [NSString stringWithUTF8Strin
     _client->Authorize(args, [weakSelf](discordpp::ClientResult r, std::string code, std::string redirectUri) {
         DiscordBridge *me = weakSelf;
         if (!me) return;
-        if (!r.Successful()) { [me log:[@"Linking was cancelled or failed: " stringByAppendingString:ns(r.Error())]]; return; }
+        if (!r.Successful()) {
+            [me log:[@"Linking was cancelled or failed: " stringByAppendingString:ns(r.Error())]];
+            [me authFailed:r.Error()];
+            return;
+        }
         me->_client->GetToken(me->_appId, code, me->_verifier->Verifier(), redirectUri, [me tokenCallback]);
     });
 }

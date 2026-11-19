@@ -34,6 +34,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) void (^onTokens)(NSString *access, NSString *refresh, NSInteger expiresIn);
 @property (nonatomic, copy, nullable) void (^onReady)(NSString *displayName);
 @property (nonatomic, copy, nullable) void (^onDisconnected)(NSString *reason);
+/// Linking, a token exchange/refresh or using a saved token failed (the reason has already gone to onLog).
+@property (nonatomic, copy, nullable) void (^onAuthFailed)(NSString *reason);
 
 @end
 

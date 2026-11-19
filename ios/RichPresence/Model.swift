@@ -8,15 +8,17 @@ import Security
 enum Keychain {
     private static let service = "io.github.noice912.richpresence.discord"
 
-    static func set(_ value: String?, for key: String) {
+    /// Returns the Keychain's answer (errSecSuccess when it worked) so the caller can say when saving failed.
+    @discardableResult
+    static func set(_ value: String?, for key: String) -> OSStatus {
         let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                    kSecAttrService as String: service, kSecAttrAccount as String: key]
-        SecItemDelete(base as CFDictionary)
-        guard let value else { return }
+        let removed = SecItemDelete(base as CFDictionary)
+        guard let value else { return removed == errSecItemNotFound ? errSecSuccess : removed }
         var add = base
         add[kSecValueData as String] = Data(value.utf8)
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(add as CFDictionary, nil)
+        return SecItemAdd(add as CFDictionary, nil)
     }
 
     static func get(_ key: String) -> String? {
@@ -54,8 +56,9 @@ final class Model: ObservableObject {
     /// One shared instance: the screen and the Shortcuts actions both use it.
     static let shared = Model()
 
-    @Published var game: String?
-    private var gameSince = Date()
+    // saved, so "the same app arriving again means it closed" still works after iOS restarted the app
+    @Published var game: String? = UserDefaults.standard.string(forKey: "game_name")
+    private var gameSince = UserDefaults.standard.object(forKey: "game_since") as? Date ?? Date()
     private var keepAlive: AVAudioPlayer?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
 
@@ -79,6 +82,8 @@ final class Model: ObservableObject {
     @Published var lyricLine: String?
     private var lyricsCache: [String: [(TimeInterval, String)]] = [:]
     private var lyricsLoading: Set<String> = []
+    /// after a failed download (no network, server error): when to try that song again
+    private var lyricsRetry: [String: Date] = [:]
     private var lyricTimer: Timer?
     // saved, so lines written while iOS ran the app in the background (Shortcuts) are still there later
     @Published var log: [String] = UserDefaults.standard.stringArray(forKey: "log") ?? []
@@ -106,7 +111,10 @@ final class Model: ObservableObject {
             MainActor.assumeIsolated { self?.gameLink.bridge.runCallbacks() }
         }
         poll = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshTrack(); self?.refreshSpotify() }
+            MainActor.assumeIsolated {
+                self?.refreshTrack(); self?.refreshSpotify()
+                self?.gameLink.refreshIfExpiring(); self?.musicLink.refreshIfExpiring()
+            }
         }
         let player = MPMusicPlayerController.systemMusicPlayer
         player.beginGeneratingPlaybackNotifications()
@@ -124,9 +132,21 @@ final class Model: ObservableObject {
             MainActor.assumeIsolated {
                 guard let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                       AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
-                self?.keepAlive?.play()
+                guard let p = self?.keepAlive else { return }
+                // the interruption also switched this app's audio off; switch it back on first
+                try? AVAudioSession.sharedInstance().setActive(true)
+                p.play()
             }
         }
+        // iOS restarted its audio system: the old player is dead, so make a new one
+        NotificationCenter.default.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.keepAlive != nil else { return }
+                self.keepAlive = nil
+                self.updateAwake()
+            }
+        }
+        if let g = game { say("Still showing: \(g)") }
         gameLink.signInSaved()
         musicLink.signInSaved()
         refreshTrack()
@@ -164,6 +184,7 @@ final class Model: ObservableObject {
 
     private func loadLyrics(_ t: Track, key: String) {
         guard !lyricsLoading.contains(key) else { return }
+        if let at = lyricsRetry[key], at > Date() { return }
         lyricsLoading.insert(key)
         var c = URLComponents(string: "https://lrclib.net/api/get")!
         c.queryItems = [.init(name: "artist_name", value: t.artist), .init(name: "track_name", value: t.title)]
@@ -171,7 +192,9 @@ final class Model: ObservableObject {
         if t.duration > 0 { c.queryItems?.append(.init(name: "duration", value: String(Int(t.duration)))) }
         var req = URLRequest(url: c.url!)
         req.setValue("RichPresence (personal use)", forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: req) { data, _, _ in
+        URLSession.shared.dataTask(with: req) { data, response, _ in
+            // 200 = found, 404 = lrclib has no lyrics for it; anything else is a failure worth another try
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             var lines: [(TimeInterval, String)] = []
             if let data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let synced = j["syncedLyrics"] as? String {
@@ -186,8 +209,12 @@ final class Model: ObservableObject {
                 }
             }
             Task { @MainActor in
-                self.lyricsCache[key] = lines.sorted { $0.0 < $1.0 }
                 self.lyricsLoading.remove(key)
+                guard status == 200 || status == 404 else {
+                    self.lyricsRetry[key] = Date().addingTimeInterval(60)
+                    return
+                }
+                self.lyricsCache[key] = lines.sorted { $0.0 < $1.0 }
                 if lines.isEmpty { self.say("No synced lyrics found for \(t.title)") }
             }
         }.resume()
@@ -267,6 +294,8 @@ final class Model: ObservableObject {
         guard !n.isEmpty else { return }
         if game != n { gameSince = Date(); say("Playing: \(n)") }
         game = n
+        UserDefaults.standard.set(n, forKey: "game_name")
+        UserDefaults.standard.set(gameSince, forKey: "game_since")
         stayAwake(true)
         push(force: true)
     }
@@ -286,6 +315,8 @@ final class Model: ObservableObject {
         guard game != nil else { return }
         say("Game closed")
         game = nil
+        UserDefaults.standard.removeObject(forKey: "game_name")
+        UserDefaults.standard.removeObject(forKey: "game_since")
         updateAwake()
         push(force: true)
     }
