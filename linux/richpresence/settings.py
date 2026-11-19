@@ -6,7 +6,7 @@ from pathlib import Path
 DATA_DIR = Path(os.environ.get('RICHPRESENCE_DATA') or Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'RichPresence')
 SETTINGS_PATH = DATA_DIR / 'settings.json'
 LIBRARY_PATH = DATA_DIR / 'library.json'
-REPO_URL = 'https://github.com/noice912/RichPresence'
+REPO_URL = 'https://github.com/noice912/Discord-status'
 
 # Discord app IDs are public (not secrets) and presence is set by each user's own Discord client,
 # so everyone can share these without overlapping. Three apps = three cards at once.

@@ -28,14 +28,14 @@ def self_command():
 
 def open_thing(target, cwd=None):
     if '://' in target or target.startswith('lutris:'):
-        subprocess.Popen(['xdg-open', target], start_new_session=True)
+        subprocess.Popen(['xdg-open', target], start_new_session=True, env=system.clean_env())
     elif target.lower().endswith('.exe'):
         runner = shutil.which('wine') or shutil.which('umu-run')
         if not runner:
             raise OSError('This is a Windows game and Wine is not installed. Start it from Steam, Lutris or Heroic instead.')
-        subprocess.Popen([runner, target], cwd=cwd, start_new_session=True)
+        subprocess.Popen([runner, target], cwd=cwd, start_new_session=True, env=system.clean_env())
     else:
-        subprocess.Popen([target], cwd=cwd, start_new_session=True)
+        subprocess.Popen([target], cwd=cwd, start_new_session=True, env=system.clean_env())
 
 
 class App:
@@ -44,6 +44,7 @@ class App:
         self.state = E.State()
         self.job = None
         self.scan_thread = None
+        self.rescan_pending = False
         self.library = S.read_library()
         self.tiles = {}
         self.pending_play = play
@@ -138,6 +139,7 @@ class App:
         self.canvas.bind('<Configure>', lambda e: self._reflow())
         for ev in ('<Button-4>', '<Button-5>', '<MouseWheel>'):
             self.canvas.bind_all(ev, self._wheel)
+        self.tile_menu = tk.Menu(self.root, tearoff=0)   # one right-click menu, filled in for the tile clicked
 
         # ---- Music & Apps
         m = self.pages['Music & Apps']
@@ -256,7 +258,7 @@ class App:
         if self.job:
             return
         self._read_from_ui()
-        self.state.stop.clear()
+        self.state.stop = threading.Event()   # a new one each time: an old engine that was slow to stop keeps its own, already set
         self.state.game_exited = False
         self.state.status = 'Starting...'
         self.push_games()
@@ -278,6 +280,7 @@ class App:
 
     def start_scan(self):
         if self.scan_thread and self.scan_thread.is_alive():
+            self.rescan_pending = True    # this scan started before the change; scan again when it ends
             return
         self.btn_rescan.configure(text='Scanning...', state='disabled')
         self._scan_done = False
@@ -308,7 +311,7 @@ class App:
             self.start_presence()
 
     def make_shortcut(self, g):
-        desktop = Path(subprocess.run(['xdg-user-dir', 'DESKTOP'], capture_output=True, text=True).stdout.strip() or Path.home() / 'Desktop') \
+        desktop = Path(subprocess.run(['xdg-user-dir', 'DESKTOP'], capture_output=True, text=True, env=system.clean_env()).stdout.strip() or Path.home() / 'Desktop') \
             if shutil.which('xdg-user-dir') else Path.home() / 'Desktop'
         apps = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'applications'
         safe = ''.join(c for c in g['name'] if c not in '\\/:*?"<>|')
@@ -399,7 +402,13 @@ class App:
                        activebackground=CARD, activeforeground=TEXT, highlightthickness=0).pack(anchor='w', padx=6)
         self._btn(f, 'Play', lambda: self.play(g), primary=True).pack(fill='x', padx=10, pady=(2, 8), side='bottom')
 
-        menu = tk.Menu(self.root, tearoff=0)
+        for w in (f, img_lbl):
+            w.bind('<Button-3>', lambda e: self._show_tile_menu(e, g))
+        return {'frame': f, 'sub': sub, 'game': g, 'widgets': [f, sub]}
+
+    def _show_tile_menu(self, e, g):
+        menu = self.tile_menu
+        menu.delete(0, 'end')
         menu.add_command(label='Add to app menu / desktop', command=lambda: self.make_shortcut(g))
         menu.add_command(label='Open install folder', command=lambda: open_thing('file://' + g['install']))
         if g['store'] == 'Added':
@@ -408,9 +417,7 @@ class App:
                 S.save(self.s)
                 self.start_scan()
             menu.add_command(label='Remove from list', command=remove)
-        for w in (f, img_lbl):
-            w.bind('<Button-3>', lambda e: menu.tk_popup(e.x_root, e.y_root))
-        return {'frame': f, 'sub': sub, 'game': g, 'widgets': [f, sub]}
+        menu.tk_popup(e.x_root, e.y_root)
 
     # ------------------------------------------------ tray
     def _start_tray(self):
@@ -473,6 +480,20 @@ class App:
                 self.pending_play = ''
                 self.play(g)
 
+    def _take_play_request(self):
+        """A second 'richpresence --play <id>' leaves the game's id in play.request for us."""
+        f = S.DATA_DIR / 'play.request'
+        if not f.is_file():
+            return
+        try:
+            gid = f.read_text(encoding='utf-8', errors='replace').strip()
+            f.unlink()
+        except OSError:
+            return
+        g = next((x for x in self.library if x['id'] == gid), None)
+        if g:
+            self.play(g)
+
     # ------------------------------------------------ updates
     def _check_updates(self):
         u = self.update
@@ -502,8 +523,10 @@ class App:
             u['state'] = 'failed'
             return
         self.append_log(f"Installed update {u['latest']}, restarting...")
-        # start the new version once this one has let go of its single-instance lock
-        subprocess.Popen(['sh', '-c', 'sleep 2; exec "$0"', new], start_new_session=True)
+        # start the new version once this one has exited and let go of its single-instance lock
+        # (waits for our pid to disappear, 15 seconds at most)
+        wait = 'n=0; while kill -0 "$1" 2>/dev/null && [ "$n" -lt 15 ]; do sleep 1; n=$((n+1)); done; exec "$0"'
+        subprocess.Popen(['sh', '-c', wait, new, str(os.getpid())], start_new_session=True, env=system.clean_env())
         self.quit()
 
     def _tick_updates(self):
@@ -524,7 +547,7 @@ class App:
             if self.s.get('auto_update') and not self.state.running_ids:
                 u['state'] = 'installing'
                 self._install_update()
-                return True
+                return self.really_quit      # a failed install must not stop the tick loop
         return False
 
     def _tick(self):
@@ -539,6 +562,11 @@ class App:
             self.rebuild_tiles()
             self.push_games()
             self._try_pending_play()
+            if self.rescan_pending:
+                self.rescan_pending = False
+                self.scan_thread.join(1)
+                self.start_scan()
+        self._take_play_request()
         if self.job:
             self.status_lbl.configure(text=f'Presence on\n{self.state.status}', fg=GREEN)
             if not self.job.is_alive():

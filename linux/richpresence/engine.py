@@ -6,6 +6,7 @@ import queue
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -21,6 +22,12 @@ def get_json(url, timeout=8):
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode('utf-8'))
+
+
+def pad2(text):
+    """Discord refuses details, state and image text shorter than 2 characters, so a 1-character
+    title or lyric gets an invisible second character."""
+    return text + '\u200b' if len(text) == 1 else text
 
 
 class State:
@@ -48,11 +55,13 @@ class Engine(threading.Thread):
         super().__init__(daemon=True)
         self.s, st = s, state
         self.st = st
+        self.stop = st.stop       # this engine's own stop signal: a restart gives the next engine a new one
         self.music = discord_ipc.Conn(S.MUSIC_ID, 'music')
         self.app = discord_ipc.Conn(S.APP_ID, 'app')
         self.game_conns = {}
         self.first_seen = {}
         self.art_cache, self.lyrics_cache = {}, {}
+        self.retry_at = {}        # lookups that broke (not 'found nothing') and when to try them again
         self.genshin, self.genshin_at = None, 0
         self.last_lyric = None
         self.app_start = None
@@ -62,7 +71,7 @@ class Engine(threading.Thread):
 
     # ------------------------------------------------ helpers
     def nap(self, sec):
-        self.st.stop.wait(sec)
+        self.stop.wait(sec)
 
     def close_all(self):
         self.music.close()
@@ -81,28 +90,42 @@ class Engine(threading.Thread):
         c.sent_at, c.card_id = time.time(), cid
         return True
 
+    def card_failed(self, c, label, e):
+        """One card's trouble with Discord stays with that card; the others keep their connections."""
+        self.st.say(f'{label} card error: {e}')
+        c.close()
+        c.card_id = None
+
+    def lookup_failed(self, key, e):
+        """A 404 means there is nothing to find, which is worth remembering. Anything else (no
+        network, a timeout, a server error) is tried again in a minute. Returns True for a real miss."""
+        if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+            return True
+        self.retry_at[key] = time.time() + 60
+        return False
+
     def album_art(self, artist, title, album):
         if not self.s.get('show_album_art'):
             return None
         key = f'{artist}|{album}|{title}'
-        if key not in self.art_cache:
+        if key not in self.art_cache and time.time() >= self.retry_at.get('art|' + key, 0):
             url = None
             try:
                 q = urllib.parse.quote(f'{artist} {album} {title}')
                 r = get_json(f'https://itunes.apple.com/search?term={q}&entity=song&limit=1')
                 if r.get('resultCount') and r['results'][0].get('artworkUrl100'):
                     url = r['results'][0]['artworkUrl100'].replace('100x100bb', '512x512bb')
-            except Exception:
-                pass
-            self.art_cache[key] = url
-        return self.art_cache[key]
+                self.art_cache[key] = url
+            except Exception as e:
+                if self.lookup_failed('art|' + key, e):
+                    self.art_cache[key] = None
+        return self.art_cache.get(key)
 
     def lyrics(self, artist, title, album, duration):
         if not self.s.get('show_lyrics'):
             return None
         key = f'{artist}|{title}|{album}'
-        if key not in self.lyrics_cache:
-            parsed = None
+        if key not in self.lyrics_cache and time.time() >= self.retry_at.get('lyrics|' + key, 0):
             try:
                 q = {'artist_name': artist, 'track_name': title}
                 if album:
@@ -115,11 +138,11 @@ class Engine(threading.Thread):
                     m = re.match(r'^\[(\d+):(\d+(?:\.\d+)?)\](.*)$', line)
                     if m:
                         lines.append((int(m.group(1)) * 60 + float(m.group(2)), m.group(3).strip()))
-                parsed = sorted(lines) or None
-            except Exception:
-                pass
-            self.lyrics_cache[key] = parsed
-        return self.lyrics_cache[key]
+                self.lyrics_cache[key] = sorted(lines) or None
+            except Exception as e:
+                if self.lookup_failed('lyrics|' + key, e):
+                    self.lyrics_cache[key] = None
+        return self.lyrics_cache.get(key)
 
     @staticmethod
     def lyric_at(lyrics, pos):
@@ -213,16 +236,21 @@ class Engine(threading.Thread):
             art = np['art'] or self.album_art(artist, title, album) or MUSIC_FALLBACK
             start = int(time.time() * 1000 - np['position'] * 1000)
             act = {
-                'type': 2, 'details': title[:128],
-                'state': (line if self.s.get('show_lyrics') and line else f'by {artist}' if artist else np['player'])[:128],
-                'assets': {'large_image': art, 'large_text': (f'{title} - {album}' if album else title)[:128]},
+                'type': 2, 'details': pad2(title[:128]),
+                'state': pad2((line if self.s.get('show_lyrics') and line else f'by {artist}' if artist else np['player'])[:128]),
+                'assets': {'large_image': art, 'large_text': pad2((f'{title} - {album}' if album else title)[:128])},
                 'timestamps': {'start': start},
             }
             if artist:
                 act['name'] = artist[:128]
             if np['length'] > 0:
                 act['timestamps']['end'] = start + int(np['length'] * 1000)
-            if self.push(self.music, act, cid, changed):
+            try:
+                sent = self.push(self.music, act, cid, changed)
+            except OSError as e:
+                self.card_failed(self.music, 'Music', e)
+                return None
+            if sent:
                 if changed:
                     self.st.say(f'Music: {artist} - {title}')
                     self.last_lyric = None
@@ -250,12 +278,16 @@ class Engine(threading.Thread):
                 if is_new or not self.app_start:
                     self.app_start = int(now * 1000)
                 act = {'type': 0, 'name': fg['label'][:128], 'timestamps': {'start': self.app_start},
-                       'assets': {'large_image': fg['icon'] or GENERIC_APP_ICON, 'large_text': fg['label'][:128]}}
+                       'assets': {'large_image': fg['icon'] or GENERIC_APP_ICON, 'large_text': pad2(fg['label'][:128])}}
                 title = fg['title'][:125] + '...' if len(fg['title']) > 128 else fg['title']
                 if title and title != fg['label']:
-                    act['details'] = title
-                if self.push(self.app, act, cid, is_new) and is_new:
-                    self.st.say(f"App: {fg['label']}")
+                    act['details'] = pad2(title)
+                try:
+                    if self.push(self.app, act, cid, is_new) and is_new:
+                        self.st.say(f"App: {fg['label']}")
+                except OSError as e:
+                    self.card_failed(self.app, 'App', e)
+                    return None
             shown = fg['label']
         elif self.app.card_id and time.time() - self.last_valid_app < 300:
             shown = self.app.card_id.split('|', 1)[1]
@@ -283,7 +315,7 @@ class Engine(threading.Thread):
     def run(self):
         st = self.st
         st.say('Presence started.')
-        while not st.stop.is_set():
+        while not self.stop.is_set():
             try:
                 if not discord_ipc.discord_running():
                     st.status = 'Waiting for Discord...'
@@ -294,14 +326,14 @@ class Engine(threading.Thread):
                 game_exes, running = set(), []
                 for g in list(st.games):
                     game_exes.update(g['exes'])
-                    if not g['enabled']:
-                        continue
                     for e in g['exes']:
                         if e in procs:
                             running.append((g, procs[e]))
                             break
                 st.running_ids = [g['id'] for g, _ in running]
                 self.check_watch()
+                # a game hidden from Discord still counts as running (above); it just gets no card
+                running = [(g, pid) for g, pid in running if g['enabled']]
 
                 self.update_games(running)
                 music = self.update_music()

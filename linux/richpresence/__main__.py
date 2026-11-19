@@ -64,6 +64,15 @@ def main(argv=None):
 
     lock = single_instance()
     if lock is None:
+        if a.play:
+            # hand the game to the copy that is already running; its window picks the file up
+            try:
+                tmp = S.DATA_DIR / 'play.request.tmp'
+                tmp.write_text(a.play, encoding='utf-8')
+                tmp.replace(S.DATA_DIR / 'play.request')
+                return 0
+            except OSError:
+                pass
         print('RichPresence is already running - check your system tray.', file=sys.stderr)
         try:
             import tkinter.messagebox as mb
@@ -74,6 +83,10 @@ def main(argv=None):
         except Exception:
             pass
         return 1
+    try:
+        (S.DATA_DIR / 'play.request').unlink(missing_ok=True)   # a request nobody picked up (e.g. after a crash)
+    except OSError:
+        pass
     if not os.environ.get('DISPLAY') and not os.environ.get('WAYLAND_DISPLAY'):
         print('No desktop session found. Use --headless to run without a window.', file=sys.stderr)
         return 1

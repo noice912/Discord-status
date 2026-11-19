@@ -198,8 +198,17 @@ def load_detectable(log):
         log("Downloading Discord's list of known games...")
         req = urllib.request.Request('https://discord.com/api/v9/applications/detectable',
                                      headers={'User-Agent': 'RichPresence (personal use)'})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            cache.write_bytes(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read()
+            json.loads(body)                 # a cut-off or broken download must not replace a good list
+            tmp = cache.with_suffix('.tmp')
+            tmp.write_bytes(body)
+            os.replace(tmp, cache)
+        except Exception as e:
+            if not cache.is_file():
+                raise
+            log(f"Couldn't download it ({e}). Using the list saved earlier.")
     return json.loads(cache.read_text(encoding='utf-8'))
 
 

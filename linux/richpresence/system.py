@@ -4,11 +4,24 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 from .scanner import exe_base
 
 _CLK = os.sysconf('SC_CLK_TCK') if hasattr(os, 'sysconf') else 100
+
+
+def clean_env():
+    """The environment for programs we start. The packaged app runs with LD_LIBRARY_PATH pointing at
+    its own bundled libraries (PyInstaller keeps the user's value in LD_LIBRARY_PATH_ORIG); games,
+    xdg-open, Wine and the like must get the user's own value back, not ours."""
+    env = dict(os.environ)
+    if 'LD_LIBRARY_PATH_ORIG' in env:
+        env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
+    elif getattr(sys, 'frozen', False):
+        env.pop('LD_LIBRARY_PATH', None)
+    return env
 
 
 def _boot_time():
@@ -85,7 +98,7 @@ _HAS_XPROP = shutil.which('xprop') is not None
 
 def _xprop(*args):
     try:
-        return subprocess.run(['xprop', *args], capture_output=True, text=True, timeout=2).stdout
+        return subprocess.run(['xprop', *args], capture_output=True, text=True, timeout=2, env=clean_env()).stdout
     except (OSError, subprocess.SubprocessError):
         return ''
 

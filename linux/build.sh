@@ -57,8 +57,8 @@ Priority: optional
 Architecture: amd64
 Depends: libc6 (>= 2.35), xdg-utils
 Recommends: x11-utils
-Maintainer: noice912 <https://github.com/noice912/RichPresence>
-Homepage: https://github.com/noice912/RichPresence
+Maintainer: noice912 <https://github.com/noice912/Discord-status>
+Homepage: https://github.com/noice912/Discord-status
 Description: Shows the games you play on Discord
  A game library that finds your Steam, Heroic, Lutris and other games and shows
  "Playing <game>" on Discord while they run, plus what you are listening to and

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import __version__
 
-API = 'https://api.github.com/repos/noice912/RichPresence/releases/latest'
+API = 'https://api.github.com/repos/noice912/Discord-status/releases/latest'
 UA = {'User-Agent': 'RichPresence updater'}
 
 
@@ -30,6 +30,7 @@ def check(current=__version__, appimage=None, release=None, log=print):
     """Returns (state, latest_version, path): state is 'current', 'available' (can't self-install),
     'ready' (a verified new AppImage is at path) or 'failed'."""
     appimage = appimage if appimage is not None else os.environ.get('APPIMAGE')
+    tmp = None
     try:
         rel = release or latest_release()
         latest = str(rel.get('tag_name', '')).lstrip('v')
@@ -62,6 +63,11 @@ def check(current=__version__, appimage=None, release=None, log=print):
         log(f'Update {latest} downloaded and verified.')
         return 'ready', latest, str(tmp)
     except Exception as e:
+        if tmp:                              # don't leave half a download next to the AppImage
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         log(f"Couldn't check for updates: {e}")
         return 'failed', None, None
 

@@ -83,6 +83,58 @@ check('a Windows (Proton) game matches by its .exe', goose.get('discordId') == '
 check('finds games in ~/Games', any(g['store'] == 'Folder' and 'pondracer' in g['exes'] for g in games))
 check('writes the library file', len(S.read_library()) == len(games))
 
+# ---- Discord's list when it is a week old and the download fails or breaks off: keep using the saved one
+import urllib.error  # noqa: E402
+import urllib.request  # noqa: E402
+
+
+class FakeDownload:
+    """Stands in for urlopen(): hands out the given chunks, then ends (or fails, if told to)."""
+
+    def __init__(self, chunks, fail=False):
+        self.chunks, self.fail = list(chunks), fail
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n=-1):
+        if self.chunks:
+            return self.chunks.pop(0)
+        if self.fail:
+            raise OSError('connection lost (test)')
+        return b''
+
+
+def no_network(*a, **k):
+    raise OSError('no network (test)')
+
+
+def duck_id(found):
+    return next((g for g in found if g['name'] == 'Duck Quest'), {}).get('discordId')
+
+
+real_urlopen = urllib.request.urlopen
+cache = data / 'detectable.json'
+saved = cache.read_bytes()
+week_old = time.time() - 8 * 86400
+try:
+    os.utime(cache, (week_old, week_old))
+    urllib.request.urlopen = no_network
+    check('an old saved Discord list is still used when the download fails', duck_id(scanner.scan(S.load(), log=lambda m: None)) == '111111111111111111')
+    urllib.request.urlopen = lambda *a, **k: FakeDownload([b'[{"id": "1111'])
+    check('...and when the download arrives cut off', duck_id(scanner.scan(S.load(), log=lambda m: None)) == '111111111111111111')
+    check('...leaving the saved list as it was', cache.read_bytes() == saved)
+    fresh = json.dumps([{'id': '333333333333333333', 'name': 'Duck Quest', 'executables': [{'os': 'linux', 'name': 'duckquest'}]}]).encode()
+    urllib.request.urlopen = lambda *a, **k: FakeDownload([fresh])
+    check('a good download replaces the saved list', duck_id(scanner.scan(S.load(), log=lambda m: None)) == '333333333333333333'
+          and cache.read_bytes() == fresh and not (data / 'detectable.tmp').exists(), sorted(x.name for x in data.iterdir()))
+finally:
+    urllib.request.urlopen = real_urlopen
+    cache.write_bytes(saved)
+
 # ---- process detection, including a Wine/Proton style command line
 p = subprocess.Popen([str(game_dir / 'duckquest'), '60'])
 w = subprocess.Popen(['/bin/bash', '-c', 'exec -a "Z:\\\\games\\\\Goose.exe" sleep 60'])
@@ -118,8 +170,12 @@ def serve(conn):
                 client = msg['client_id']
                 out = {'cmd': 'DISPATCH', 'evt': 'READY', 'data': {'v': 1}}
             else:
-                received.append((client, msg['args'].get('activity')))
-                out = {'cmd': 'SET_ACTIVITY', 'evt': None, 'nonce': msg['nonce'], 'data': msg['args'].get('activity')}
+                act = msg['args'].get('activity')
+                received.append((client, act))
+                if act and act.get('details') == 'Refuse Me':   # lets a test make Discord say no to one card
+                    out = {'cmd': 'SET_ACTIVITY', 'evt': 'ERROR', 'nonce': msg['nonce'], 'data': {'code': 4000, 'message': 'Refused (test)'}}
+                else:
+                    out = {'cmd': 'SET_ACTIVITY', 'evt': None, 'nonce': msg['nonce'], 'data': act}
             b = json.dumps(out).encode()
             conn.sendall(struct.pack('<ii', 1, len(b)) + b)
     except OSError:
@@ -147,6 +203,47 @@ held.s['official_delay_minutes'] = 0
 held.update_games([(dict(by['Duck Quest'], enabled=True), p.pid)])
 check('...and then gets our own card', len(received) > before and received[-1][1] and received[-1][1].get('name') == 'Duck Quest')
 held.close_all()
+
+
+def run_engine(eng, until, seconds=15):
+    """Runs an engine until until() is true (or time is up), stops it and returns what it logged."""
+    eng.start()
+    deadline = time.time() + seconds
+    while time.time() < deadline and not until():
+        time.sleep(0.2)
+    eng.st.stop.set()
+    eng.join(10)
+    lines = []
+    while not eng.st.log.empty():
+        lines.append(eng.st.log.get_nowait())
+    return lines
+
+
+# ---- a game hidden from Discord still counts as running, so "quit when the game closes" can see it
+s5 = dict(S.load(), show_music=False, show_current_app=False, official_to_discord=False, disabled_games=['steam:4242'])
+st5 = E.State()
+st5.games = E.engine_games(games, s5)
+st5.watch_id = 'steam:4242'
+mark = len(received)
+eng5 = E.Engine(s5, st5)
+run_engine(eng5, lambda: eng5.watch['seen'])
+check('a running game that is hidden from Discord is seen by "quit when the game closes"', eng5.watch['seen'] and 'steam:4242' in st5.running_ids, st5.running_ids)
+check('...and still gets no card', not any(a and a.get('name') == 'Duck Quest' for _, a in received[mark:]), received[mark:])
+
+# ---- Discord refusing the music card must not take the game card down with it
+real_now_playing = system.now_playing
+system.now_playing = lambda music_only=False: {'player': 'spotify', 'title': 'Refuse Me', 'artist': 'The Ducks', 'album': 'Pond',
+                                               'art': 'https://example.com/a.jpg', 'length': 200.0, 'position': 50.0}
+s6 = dict(S.load(), show_music=True, show_lyrics=False, show_album_art=False, show_current_app=False, official_to_discord=False)
+st6 = E.State()
+st6.games = E.engine_games(games, s6)
+eng6 = E.Engine(s6, st6)
+refused = lambda: sum(1 for c, a in received if c == S.MUSIC_ID and a and a.get('details') == 'Refuse Me')  # noqa: E731
+log6 = run_engine(eng6, lambda: refused() >= 3, 20)
+system.now_playing = real_now_playing
+check('the music card was refused a few times in a row', refused() >= 3, log6)
+check('...which is logged as a music card problem', any('Music card error' in l for l in log6), log6)
+check('...while the game card stays connected (sent once, not torn down and redone)', sum(1 for l in log6 if 'Playing: Duck Quest' in l) == 1, log6)
 
 s = dict(S.load(), show_music=False, show_current_app=False, official_to_discord=False)
 st = E.State()
@@ -191,6 +288,65 @@ if music:
           and m['assets']['large_image'] == 'https://example.com/a.jpg' and m['timestamps']['end'] - m['timestamps']['start'] == 200000)
 eng2.close_all()
 
+# ---- a 1-character title or lyric: Discord refuses text shorter than 2 characters
+eng3 = E.Engine(dict(S.load(), show_lyrics=True, show_album_art=False), E.State())
+eng3.lyrics_cache['B|A|'] = [(0.0, 'O')]
+system.now_playing = lambda music_only=False: {'player': 'spotify', 'title': 'A', 'artist': 'B', 'album': '',
+                                               'art': 'https://example.com/a.jpg', 'length': 0, 'position': 5.0}
+E.system.now_playing = system.now_playing
+eng3.update_music()
+m = ([a for c, a in received if c == S.MUSIC_ID and a] or [{}])[-1]
+short = [k for k, v in (('details', m.get('details', '')), ('state', m.get('state', '')), ('large_text', m.get('assets', {}).get('large_text', ''))) if len(v) < 2]
+check('a 1-character title and lyric are never sent shorter than 2 characters', m.get('details', '').startswith('A') and m.get('state', '').startswith('O') and not short, m)
+eng3.close_all()
+
+# ---- lyrics and album art: a lookup that breaks is tried again later, one that finds nothing is remembered
+eng7 = E.Engine(dict(S.load(), show_lyrics=True, show_album_art=True), E.State())
+calls = []
+real_get_json = E.get_json
+
+
+def broken(url, timeout=8):
+    calls.append(url)
+    raise OSError('no network (test)')
+
+
+def answers(reply):
+    def get(url, timeout=8):
+        calls.append(url)
+        return reply
+    return get
+
+
+def not_found(url, timeout=8):
+    calls.append(url)
+    raise urllib.error.HTTPError(url, 404, 'Not Found', None, None)
+
+
+E.get_json = broken
+check('a lyrics or art lookup that breaks gives nothing', eng7.lyrics('The Ducks', 'Quack Song', 'Pond', 200) is None
+      and eng7.album_art('The Ducks', 'Quack Song', 'Pond') is None and len(calls) == 2, calls)
+check('...and is not remembered as "this song has none"', not eng7.lyrics_cache and not eng7.art_cache, (eng7.lyrics_cache, eng7.art_cache))
+eng7.lyrics('The Ducks', 'Quack Song', 'Pond', 200)
+eng7.album_art('The Ducks', 'Quack Song', 'Pond')
+check('...nor asked again on the very next look', len(calls) == 2, calls)
+eng7.retry_at.clear()   # as if the wait before the next try were over
+E.get_json = answers({'syncedLyrics': '[00:01.00]Quack', 'resultCount': 1, 'results': [{'artworkUrl100': 'https://example.com/100x100bb.jpg'}]})
+check('...so a later try can still find them', eng7.lyrics('The Ducks', 'Quack Song', 'Pond', 200) == [(1.0, 'Quack')]
+      and eng7.album_art('The Ducks', 'Quack Song', 'Pond') == 'https://example.com/512x512bb.jpg')
+E.get_json = answers({'syncedLyrics': '', 'resultCount': 0, 'results': []})
+before = len(calls)
+for _ in range(2):
+    none_l, none_a = eng7.lyrics('Nobody', 'Silence', '', 0), eng7.album_art('Nobody', 'Silence', '')
+check('a song with no lyrics and no art is remembered and asked about once', none_l is None and none_a is None and len(calls) == before + 2
+      and 'Nobody|Silence|' in eng7.lyrics_cache and 'Nobody||Silence' in eng7.art_cache, calls[before:])
+E.get_json = not_found
+before = len(calls)
+for _ in range(2):
+    none_l = eng7.lyrics('Nobody', 'Hush', '', 0)
+check('"not found" (404) from the lyrics site counts as no lyrics too', none_l is None and len(calls) == before + 1 and 'Nobody|Hush|' in eng7.lyrics_cache, calls[before:])
+E.get_json = real_get_json
+
 # ---- updates
 from richpresence import updater  # noqa: E402
 check('versions compare as numbers', updater.version_tuple('v1.10.0') > updater.version_tuple('1.9.3') and updater.version_tuple('1.2') == (1, 2, 0))
@@ -206,13 +362,32 @@ if path:
     new = updater.install(path, appimage=str(fake_app))
     check('...and swaps it in, executable', new == str(fake_app) and fake_app.stat().st_size > 10_000_000 and os.access(fake_app, os.X_OK) and not os.path.exists(path))
 bad_release = {'tag_name': 'v99.0.0', 'assets': [{'name': 'RichPresence-x86_64.AppImage', 'digest': 'sha256:' + '0' * 64,
-       'browser_download_url': 'https://github.com/noice912/RichPresence/releases/latest/download/SHA256SUMS-linux.txt'}]}
+       'browser_download_url': 'https://github.com/noice912/Discord-status/releases/latest/download/SHA256SUMS-linux.txt'}]}
 before = fake_app.read_bytes()[:64]
 st_, latest, path = updater.check(current='1.0.0', appimage=str(fake_app), release=bad_release, log=lambda m: None)
 check('a download that fails its checksum is thrown away', st_ == 'failed' and fake_app.read_bytes()[:64] == before
       and not os.path.exists(str(fake_app) + '.download'), st_)
 nodigest = {'tag_name': 'v99.0.0', 'assets': [{'name': 'RichPresence-x86_64.AppImage', 'browser_download_url': 'https://example.com/x'}]}
 check('an update without a published checksum is refused', updater.check(current='1.0.0', appimage=str(fake_app), release=nodigest, log=lambda m: None)[0] == 'failed')
+urllib.request.urlopen = lambda *a, **k: FakeDownload([b'half of it'], fail=True)
+try:
+    st_, latest, path = updater.check(current='1.0.0', appimage=str(fake_app), release=bad_release, log=lambda m: None)
+finally:
+    urllib.request.urlopen = real_urlopen
+check('a download that breaks off half-way leaves no .download file behind', st_ == 'failed' and not os.path.exists(str(fake_app) + '.download'), st_)
+
+# ---- a second copy started with --play hands the game to the one already running
+from richpresence import __main__ as M  # noqa: E402
+os.environ.pop('WAYLAND_DISPLAY', None)
+request = data / 'play.request'
+lock = M.single_instance()
+code = M.main(['--play', 'steam:4242'])
+check('a second copy with --play leaves the game id for the running one and exits 0', lock is not None and code == 0
+      and request.is_file() and request.read_text() == 'steam:4242', code)
+lock.close()
+request.write_text('steam:4242')
+M.main([])   # takes the lock, then stops because the test has no desktop
+check('a request left over from before is deleted when the app starts', not request.exists())
 
 srv.close()
 shutil.rmtree(TMP, ignore_errors=True)
