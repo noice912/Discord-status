@@ -17,3 +17,4 @@ ios/sdk/*
 !ios/sdk/README.md
 ios/*.xcodeproj/
 ios/build.log
+CHAT_HANDOFF.md
