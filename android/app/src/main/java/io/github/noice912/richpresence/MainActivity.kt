@@ -3,6 +3,7 @@ package io.github.noice912.richpresence
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.NotificationManager
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -16,6 +17,8 @@ import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 /** One scrolling screen: permissions, start/stop, options, your games, and the log. */
 class MainActivity : Activity() {
@@ -44,7 +47,14 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.statusBarColor = bg
         root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(18), dp(18), dp(18)) }
-        setContentView(ScrollView(this).apply { setBackgroundColor(bg); addView(root) })
+        val scroll = ScrollView(this).apply { setBackgroundColor(bg); addView(root) }
+        setContentView(scroll)
+        // Android 15+ draws the app under the status and navigation bars; keep the content clear of them
+        ViewCompat.setOnApplyWindowInsetsListener(scroll) { v, insets ->
+            val b = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            v.setPadding(b.left, b.top, b.right, b.bottom)
+            insets
+        }
 
         label("RichPresence", 26f, fg, bold = true)
         label("Shows the game or song you're playing on your Discord status.", 14f, dim)
@@ -60,6 +70,7 @@ class MainActivity : Activity() {
             discordLbl.text = "This build doesn't include Discord linking, so it only shows below what it would put on your status."
         } else {
             PresenceProvider.connect(this)
+            getSystemService(NotificationManager::class.java).cancel(PresenceService.RECONNECT_ID)
         }
 
         section("Permissions")
@@ -68,7 +79,7 @@ class MainActivity : Activity() {
 
         section("Presence")
         status = label("", 14f, dim)
-        toggle = button("Start") { if (prefs.running) PresenceService.stop(this) else start(); refresh() }.apply { contentDescription = "presence-toggle"; isAllCaps = false }
+        toggle = button("Start") { if (PresenceService.alive) PresenceService.stop(this) else start(); refresh() }.apply { contentDescription = "presence-toggle"; isAllCaps = false }
 
         section("Show")
         check("The game I'm playing", prefs.showGames) { prefs.showGames = it }
@@ -120,6 +131,10 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         Bus.listener = { refresh() }
+        // it was left on, but Android stopped it (an update, a crash, "force stop"): turn it back on
+        if (prefs.running && !PresenceService.alive) {
+            try { PresenceService.start(this) } catch (e: Exception) { Bus.say("Couldn't restart the presence: ${e.message}") }
+        }
         refresh()
         fillGames()
         checkForUpdate(force = false)
@@ -147,9 +162,10 @@ class MainActivity : Activity() {
             discordLbl.setTextColor(if (who != null) green else dim)
             linkBtn.text = if (who != null) "Unlink" else "Link Discord account"
         }
-        toggle.text = if (prefs.running) "Stop" else "Start"
-        status.text = if (prefs.running) "On  -  ${Bus.status}" else "Off"
-        status.setTextColor(if (prefs.running) green else dim)
+        val on = PresenceService.alive
+        toggle.text = if (on) "Stop" else "Start"
+        status.text = if (on) "On  -  ${Bus.status}" else "Off"
+        status.setTextColor(if (on) green else dim)
         log.text = synchronized(Bus) { Bus.lines.toList().takeLast(60).joinToString("\n") }
     }
 

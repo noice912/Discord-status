@@ -17,7 +17,7 @@ import java.security.MessageDigest
  * downloads the new APK, checks it against the SHA-256 GitHub publishes, and opens the installer.
  */
 object Updater {
-    private const val API = "https://api.github.com/repos/noice912/RichPresence/releases/latest"
+    private const val API = "https://api.github.com/repos/noice912/Discord-status/releases/latest"
     private const val ASSET = "RichPresence-android.apk"
 
     sealed class Result {

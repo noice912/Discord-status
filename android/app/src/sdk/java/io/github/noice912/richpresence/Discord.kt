@@ -23,7 +23,12 @@ object DiscordNative {
     @JvmStatic external fun clear()
 
     @JvmStatic fun onLog(msg: String) = Bus.say(msg)
-    @JvmStatic fun onAuthError(msg: String) { Discord.linking = false; Bus.say(msg) }
+    @JvmStatic fun onAuthError(msg: String) {
+        val wasLinking = Discord.linking
+        Discord.linking = false
+        Bus.say(msg)
+        if (!wasLinking) Discord.signInFailed()
+    }
     @JvmStatic fun onTokens(access: String, refresh: String, expiresIn: Int) = Discord.saveTokens(access, refresh, expiresIn)
     @JvmStatic fun onUser(name: String) = Discord.setUser(name)
     @JvmStatic fun onStatus(status: Int, error: String) = Discord.setStatus(status, error)
@@ -32,6 +37,7 @@ object DiscordNative {
 /** One Discord connection for the whole app, shared by the screen (linking) and the service (status). */
 object Discord {
     private const val READY = 3
+    private const val DISCONNECTED = 0
     private val main = Handler(Looper.getMainLooper())
     private lateinit var app: Context
     private var started = false
@@ -40,6 +46,18 @@ object Discord {
         private set
     var linking = false
     private var onReady: (() -> Unit)? = null
+    private var signInAt = 0L       // when the saved sign-in was last sent; 0 = none under way
+    private var retryStep = 0
+    private var retryPending = false
+    private var lastStatus = DISCONNECTED
+    private var readyAt = 0L        // when the connection last became ready
+
+    // Tries the saved sign-in again after the connection was lost or a sign-in failed.
+    // Left alone while the SDK is connecting by itself; if that fails, "disconnected" schedules this again.
+    private val retry: Runnable = Runnable {
+        retryPending = false
+        if (!ready && !linking && lastStatus == DISCONNECTED && !signInSaved()) scheduleRetry()
+    }
 
     private val pump = object : Runnable {
         override fun run() {
@@ -62,6 +80,9 @@ object Discord {
         attached = true
     }
 
+    /** True when there is a linked account but the SDK can't start yet, because no screen has been opened. */
+    fun needsApp(c: Context) = !attached && hasTokens(c)
+
     fun ensure(c: Context, whenReady: (() -> Unit)? = null) {
         app = c.applicationContext
         if (whenReady != null) onReady = whenReady
@@ -72,12 +93,34 @@ object Discord {
             main.post(pump)
         }
         if (ready || linking) return
+        signInSaved()
+    }
+
+    /** Signs in with the saved account. Returns false if nothing was sent (not linked, or a sign-in is already under way). */
+    private fun signInSaved(): Boolean {
         val p = prefs()
         val access = p.getString("access", null)
-        val refresh = p.getString("refresh", null) ?: return
+        val refresh = p.getString("refresh", null) ?: return false
+        // only one sign-in at a time; one that hasn't answered within a minute is given up on
+        val now = System.currentTimeMillis()
+        if (signInAt != 0L && now >= signInAt && now - signInAt < 60_000L) return false
+        signInAt = now
         // refresh a day before the 7-day access token runs out
         if (access == null || System.currentTimeMillis() > p.getLong("expires_at", 0) - 86_400_000) DiscordNative.refresh(refresh)
         else DiscordNative.useToken(access)
+        return true
+    }
+
+    private fun scheduleRetry() {
+        if (retryPending || !started || !hasTokens(app)) return
+        retryPending = true
+        main.postDelayed(retry, Retry.delayMs(retryStep++))
+    }
+
+    /** A saved sign-in (not a new link) was refused or couldn't reach Discord. */
+    fun signInFailed() {
+        signInAt = 0
+        scheduleRetry()
     }
 
     fun link(a: Activity) {
@@ -92,6 +135,10 @@ object Discord {
         c.getSharedPreferences("discord", Context.MODE_PRIVATE).edit().clear().apply()
         if (started) DiscordNative.disconnect()
         ready = false
+        main.removeCallbacks(retry)
+        retryPending = false
+        retryStep = 0
+        signInAt = 0
         Bus.say("Discord account unlinked.")
     }
 
@@ -109,8 +156,20 @@ object Discord {
 
     fun setStatus(status: Int, error: String) {
         val was = ready
+        lastStatus = status
         ready = status == READY
         if (error.isNotEmpty()) Bus.say("Discord connection: $error")
+        if (ready) {
+            signInAt = 0
+            if (!was) readyAt = System.currentTimeMillis()
+            if (retryPending) { main.removeCallbacks(retry); retryPending = false }
+        } else if (status == DISCONNECTED) {
+            // the SDK reconnects by itself after a short drop; "disconnected" means it has given up
+            signInAt = 0
+            // start again from a short wait only after a connection that lasted
+            if (was && System.currentTimeMillis() - readyAt > 60_000L) retryStep = 0
+            if (!linking) scheduleRetry()
+        }
         if (ready && !was) onReady?.invoke()
     }
 }
@@ -125,8 +184,11 @@ class SdkPresence : Presence {
 
     override val ready get() = Discord.ready
     override val accountName: String? = null
+    private var appContext: Context? = null
+    override val needsApp: Boolean get() = appContext?.let { Discord.needsApp(it) } ?: false
 
     override fun start(context: Context, log: (String) -> Unit) {
+        appContext = context.applicationContext
         if (!Discord.hasTokens(context)) log("Link your Discord account in the app to show your status.")
         Discord.ensure(context) { shown = null; send() }
     }

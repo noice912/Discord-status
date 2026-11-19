@@ -10,10 +10,18 @@ import android.content.Context
 interface Presence {
     val ready: Boolean
     val accountName: String?
+    /** True when Discord can't be reached until the app's screen has been opened once. */
+    val needsApp: Boolean get() = false
     fun start(context: Context, log: (String) -> Unit)
     fun show(card: Card)
     fun clear(kind: Card.Kind)
     fun stop()
+}
+
+/** How long to wait before trying to reconnect to Discord again: 5 s, 30 s, 2 min, then every 10 min. */
+object Retry {
+    private val steps = longArrayOf(5_000, 30_000, 120_000, 600_000)
+    fun delayMs(attempt: Int): Long = steps[attempt.coerceIn(0, steps.size - 1)]
 }
 
 class LogOnlyPresence : Presence {

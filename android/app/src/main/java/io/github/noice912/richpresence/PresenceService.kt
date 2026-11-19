@@ -37,6 +37,10 @@ class PresenceService : Service() {
 
     companion object {
         private const val CHANNEL = "presence"
+        const val RECONNECT_ID = 2
+        /** True only while the service is really running in this process (the saved "running" flag can be stale). */
+        @Volatile var alive = false
+            private set
         fun start(c: Context) {
             Prefs(c).running = true
             val i = Intent(c, PresenceService::class.java)
@@ -52,6 +56,7 @@ class PresenceService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        alive = true
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(NotificationChannel(CHANNEL, "Presence running", NotificationManager.IMPORTANCE_LOW))
         val n = notification("Starting...")
@@ -59,7 +64,24 @@ class PresenceService : Service() {
         presence = PresenceProvider.create()
         presence.start(this, Bus::say)
         Bus.say("Presence started.")
+        if (presence.needsApp) askToOpen(nm)
         handler.post(tick)
+    }
+
+    /**
+     * Android restarted the service without the app's screen, and Discord's SDK can't start without it.
+     * Android 13+ only shows this if notifications are allowed; the log line is there either way.
+     */
+    private fun askToOpen(nm: NotificationManager) {
+        Bus.say("Discord can't reconnect until the app is opened (Android restarted it in the background). Open RichPresence once.")
+        try {
+            val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+            val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL) else @Suppress("DEPRECATION") Notification.Builder(this)
+            nm.notify(RECONNECT_ID, b.setSmallIcon(android.R.drawable.stat_notify_sync_noanim).setContentTitle("RichPresence")
+                .setContentText("Open RichPresence to reconnect to Discord").setContentIntent(open).setAutoCancel(true).build())
+        } catch (e: Exception) {
+            Bus.say("Couldn't show the reconnect notification: ${e.message}")
+        }
     }
 
     private fun notification(text: String): Notification {
@@ -107,7 +129,9 @@ class PresenceService : Service() {
     }
 
     override fun onDestroy() {
+        alive = false
         handler.removeCallbacks(tick)
+        getSystemService(NotificationManager::class.java).cancel(RECONNECT_ID)
         Card.Kind.entries.forEach { if (sent.containsKey(it)) presence.clear(it) }
         presence.stop()
         Bus.status = "Stopped"
