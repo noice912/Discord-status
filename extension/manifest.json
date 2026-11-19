@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "RichPresence - what you're watching",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Show the show and episode you're watching on Netflix, Hulu, Disney+, Prime Video and more on your Discord status.",
   "icons": { "48": "icon48.png", "128": "icon128.png" },
   "host_permissions": ["http://127.0.0.1/*"],

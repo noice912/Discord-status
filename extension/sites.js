@@ -6,6 +6,9 @@
 // When read() finds no title, the page's media info (navigator.mediaSession) and then the tab title are used.
 const path = () => location.pathname;
 const remember = {};          // per page: the last title seen, for when the player overlay hides
+let pageKey = '';             // the page + video that remember[] currently holds a title for
+const atvSeen = new WeakSet();   // Apple TV+ videos that have been seen with the sound on
+let ytKey, ytPolls = 0;       // YouTube: the video last seen, and polls since it changed
 
 const SITES = [
   {
@@ -72,17 +75,31 @@ const SITES = [
   },
   {
     hosts: /(^|\.)peacocktv\.com$/, service: 'Peacock', marks: ['Peacock'],
-    player: () => path().includes('/watch/playback') || path().includes('/watch/'),
+    // only the playback page: /watch/home, /watch/asset/... are browse and detail pages with previews
+    player: () => path().includes('/watch/playback'),
     read: () => ({ title: RP.text('[data-testid="playback-title"]', '[class*="playback-title"]'), episode: RP.text('[data-testid="playback-subtitle"]', '[class*="playback-subtitle"]') })
   },
   {
     hosts: /^tv\.apple\.com$/, service: 'Apple TV+', marks: ['Apple TV+', 'Apple TV'], deep: true,
-    player: () => !!RP.video(true),
+    // not the previews on browse pages: those loop, are short, or never have the sound on.
+    // A video that has had sound once still counts after you mute it.
+    player: () => {
+      const v = RP.video(true);
+      if (!v || v.loop || !(v.duration > 60)) return false;
+      if (!v.muted) atvSeen.add(v);
+      return atvSeen.has(v);
+    },
     read: () => ({ title: '', episode: '' })            // Apple sets the page's media info; the fallback reads it
   },
   {
     hosts: /^app\.plex\.tv$/, service: 'Plex', marks: ['Plex'],
-    player: () => !!document.querySelector('[class*="Player"]'),
+    // the video has to sit inside the player itself; a "Player" element elsewhere on the page only
+    // counts while the video is actually playing
+    player: () => {
+      const v = RP.video();
+      if (!v || !v.closest) return false;
+      return !!v.closest('[class*="Player"]') || (!v.paused && !v.ended && !!document.querySelector('[class*="Player"]'));
+    },
     read: () => {
       const links = [...document.querySelectorAll('[class*="PlayerControlsMetadata"] a')].map(a => a.textContent.trim()).filter(Boolean);
       return { title: links[0] || '', episode: links[1] || '' };
@@ -93,8 +110,15 @@ const SITES = [
     player: () => path() === '/watch' || path().startsWith('/live/'),
     read: () => {
       const id = new URLSearchParams(location.search).get('v');
+      // just moved to another video: the page still shows the old title, so skip this poll, and one
+      // more if the title on the page and the page's media info still disagree
+      const now = id || path();
+      if (now !== ytKey) { ytKey = now; ytPolls = 0; return { wait: true }; }
+      const title = RP.text('h1.ytd-watch-metadata yt-formatted-string', 'h1.ytd-watch-metadata', '#title h1');
+      const heard = RP.session().title;
+      if (++ytPolls <= 1 && title && heard && title !== heard) return { wait: true };
       return {
-        title: RP.text('h1.ytd-watch-metadata yt-formatted-string', 'h1.ytd-watch-metadata', '#title h1'),
+        title,
         episode: RP.text('ytd-watch-metadata #channel-name a', '#owner #channel-name a', 'ytd-channel-name a'),
         image: id && /^[\w-]{6,20}$/.test(id) ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : ''
       };
@@ -150,7 +174,10 @@ if (SITE) {
     const video = SITE.player() ? RP.video(SITE.deep) : null;
     if (!video) return RP.stop(SITE.service);
     let got = (await SITE.read()) || {};
-    const key = location.pathname + location.search;
+    if (got.wait) return;
+    // a remembered title belongs to one page and one video; forget it when either changes
+    const key = location.pathname + location.search + location.hash + '|' + (video.currentSrc || '');
+    if (key !== pageKey) { delete remember[pageKey]; pageKey = key; }
     if (got.title) remember[key] = got;
     else if (remember[key]) got = remember[key];
     else {

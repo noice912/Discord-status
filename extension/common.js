@@ -4,8 +4,14 @@
 const RP = {
   lastKey: '',
   lastSent: 0,
+  lastPos: 0,
   stopped: true,
+  service: '',           // the service last reported, for the stop when the tab closes
+  pausedSince: 0,        // when the current title was first seen paused (0 while playing)
+  pausedWhat: '',
   remote: null,          // video state relayed from an embedded player frame (Crunchyroll)
+  // a random id for this tab's page, so two tabs of one service don't overwrite each other in the app
+  tab: [...crypto.getRandomValues(new Uint8Array(16))].map(b => 'abcdefghijklmnopqrstuvwxyz0123456789'[b % 36]).join(''),
 
   // the biggest <video> on the page is the one being watched; "deep" also looks inside shadow roots
   video(deep) {
@@ -61,6 +67,7 @@ const RP = {
 
   report(service, title, episode, video, image) {
     const info = {
+      tab: this.tab,
       service,
       title: (title || '').slice(0, 128),
       episode: (episode || '').slice(0, 128),
@@ -71,9 +78,19 @@ const RP = {
     };
     const key = JSON.stringify([info.service, info.title, info.episode, info.playing]);
     const now = Date.now();
+    this.service = service;
+    // paused: keep reporting for a minute, then say "stopped" once and stay quiet until it plays again
+    const what = JSON.stringify([info.service, info.title, info.episode]);
+    if (info.playing) this.pausedSince = 0;
+    else if (!this.pausedSince || what !== this.pausedWhat) { this.pausedSince = now; this.pausedWhat = what; }
+    if (!info.playing && now - this.pausedSince > 60000) return this.stop(service);
     this.stopped = false;
-    if (key === this.lastKey && now - this.lastSent < 10000) return;
-    this.lastKey = key; this.lastSent = now;
+    // a seek: the position is more than 3 s away from where the last report said it would be by now
+    const rate = (video && video.playbackRate) || 1;
+    const expected = this.lastPos + (info.playing ? (now - this.lastSent) / 1000 * rate : 0);
+    const jumped = Math.abs(info.position - expected) > 3;
+    if (key === this.lastKey && !jumped && now - this.lastSent < 10000) return;
+    this.lastKey = key; this.lastSent = now; this.lastPos = info.position;
     this.post(info);
   },
 
@@ -81,11 +98,11 @@ const RP = {
   stop(service) {
     if (this.stopped) return;
     this.stopped = true; this.lastKey = '';
-    this.post({ service, title: '', episode: '', image: '', playing: false, position: 0, duration: 0 });
+    this.post({ tab: this.tab, service, title: '', episode: '', image: '', playing: false, position: 0, duration: 0 }, true);
   },
 
-  post(info) {
-    try { chrome.runtime.sendMessage({ type: 'watching', info }); } catch (e) {}
+  post(info, stop) {
+    try { chrome.runtime.sendMessage({ type: 'watching', info, stop: !!stop }); } catch (e) {}
   },
 
   every(ms, fn) {
@@ -94,3 +111,6 @@ const RP = {
     setInterval(run, ms);
   }
 };
+
+// the tab is closing or leaving the site: say "stopped" for what it last reported
+window.addEventListener('pagehide', () => { if (RP.service) RP.stop(RP.service); });
