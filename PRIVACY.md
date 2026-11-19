@@ -56,5 +56,5 @@ RichPresence doesn't collect personal information from anyone, including childre
 ## Changes and contact
 
 Changes to this policy are published in this file in the
-[RichPresence repository](https://github.com/noice912/RichPresence). Questions: open an issue at
-https://github.com/noice912/RichPresence/issues.
+[RichPresence repository](https://github.com/noice912/Discord-status). Questions: open an issue at
+https://github.com/noice912/Discord-status/issues.

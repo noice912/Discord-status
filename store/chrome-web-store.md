@@ -23,7 +23,7 @@ Upload file: `RichPresence-extension.zip` from the latest release (or `dist\Rich
 > This extension is the companion to RichPresence, a free, open-source app for Windows that shows what you're playing, listening to and watching on Discord. On a streaming site's player page, the extension reads the title, the episode and whether the video is playing, and passes them to the RichPresence app on your own computer. RichPresence then shows them on your Discord status, with the show's poster and a progress bar. Pause, and the status goes away.
 >
 > You need:
-> - the RichPresence app for Windows, version 1.6.0 or newer (free): https://github.com/noice912/RichPresence/releases/latest
+> - the RichPresence app for Windows, version 1.6.0 or newer (free): https://github.com/noice912/Discord-status/releases/latest
 > - the Discord desktop app, with "Share your detected activity with others" turned on
 >
 > Click the extension's icon to check that it's connected and to see what it's reading.
@@ -45,7 +45,7 @@ Upload file: `RichPresence-extension.zip` from the latest release (or `dist\Rich
 
 **Small promo tile (440x280, optional):** `store/promo-small.png`
 
-**Website / Support URL:** https://github.com/noice912/RichPresence
+**Website / Support URL:** https://github.com/noice912/Discord-status
 
 ## Privacy practices tab
 
@@ -68,7 +68,7 @@ Leave everything else unticked (personally identifiable info, health, financial,
 - I do not use or transfer user data for purposes that are unrelated to my item's single purpose
 - I do not use or transfer user data to determine creditworthiness or for lending purposes
 
-**Privacy policy URL:** https://github.com/noice912/RichPresence/blob/main/PRIVACY.md
+**Privacy policy URL:** https://github.com/noice912/Discord-status/blob/main/PRIVACY.md
 
 ## Distribution tab
 

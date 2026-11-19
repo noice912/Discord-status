@@ -1,3 +1,51 @@
+## RichPresence 2.1.6
+
+### Spotify with live lyrics (Windows)
+The music card now works with the **Spotify** app as well as Apple Music: the song, its album art and the
+**current lyric line**, updating as the song plays. It's on by default; turn it off under **Music & Apps**.
+
+If your Spotify is linked to Discord, Discord shows its own Spotify card too. To keep just the one with
+lyrics, turn off **Display Spotify as your status** in Discord's Connections settings.
+
+### Fixes: Windows
+- A game's desktop shortcut now starts the game when RichPresence is already running in the tray
+- Typing `[` in the game search no longer empties the grid; searching no longer uses more memory with every key
+- Updates never install while any game from your library is running, even with presence off or Discord closed
+- "Quit when my game closes" works while Discord is closed
+- A failed update is not retried in a loop, and the update file is checked again right before it installs
+- A wrong custom App ID is reported once in the Log instead of every few seconds
+- If presence stops on its own, the reason now appears in the Log
+- The window no longer freezes on Stop, Apply or Quit when Discord or Windows is slow to answer
+- Add game and Save & rescan during a scan are no longer ignored
+- The Watching progress bar is right on PCs that write decimals with a comma
+
+### Fixes: browser extension (1.2.0)
+- Two tabs of the same site no longer overwrite each other
+- Closing the tab clears the card; a video paused for a minute clears it too
+- Skipping forward or back updates the progress bar straight away
+- Apple TV+ and Peacock preview trailers no longer count as watching
+- No more leftover title from the previous video on Plex, Prime Video and YouTube
+
+### Fixes: Linux
+- A game's menu shortcut starts the game when RichPresence is already running
+- "Quit when the game I launched closes" works for games hidden from Discord
+- One rejected card no longer takes the other cards down with it
+- A lyrics or album-art lookup that fails once is tried again later
+- Games keep their Discord match when the game list can't be downloaded
+- A failed update no longer freezes the status and log; restarting after an update is more reliable
+- Games and apps started from the AppImage use the system's own libraries
+
+### Fixes: Android and iPhone
+These were built by GitHub but **have not been tested on a phone**. If something is worse than 1.6.0,
+please open an issue.
+- Android: if the system restarts RichPresence in the background, a notification asks you to open it to reconnect to Discord
+- Android: reconnects to Discord after the connection drops; the Start/Stop button shows the real state; the screen fits under the status bar on Android 15
+- iPhone: cancelling a Discord link no longer leaves the button stuck on "Waiting for Discord..."
+- iPhone: the game you set is remembered if iOS restarts the app; reconnects to Discord after a drop
+- iPhone: stays running after a phone call interrupts it; a failed lyrics lookup is tried again
+
+Every file is built by GitHub Actions from this repository's source.
+
 ## RichPresence 1.6.0
 
 ### The browser extension now covers every streaming service

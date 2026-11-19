@@ -7,7 +7,7 @@
 <p align="center">
   A game library that shows what you're playing on Discord.<br>
   It finds the games installed on your PC, like the NVIDIA app does, and shows <b>"Playing &lt;game&gt;"</b> while they run.<br>
-  It can also show your <b>Apple Music</b> song (with lyrics) and the <b>app you're using</b>, all at the same time.
+  It can also show your <b>Apple Music</b> or <b>Spotify</b> song (with live lyrics) and the <b>app you're using</b>, all at the same time.
 </p>
 
 **No setup, no Discord developer account, no IDs to copy.** Download, open, done.
@@ -65,7 +65,7 @@ The tray icon needs a desktop with a system tray (KDE, Cinnamon, XFCE, or GNOME 
 |---|---|
 | **Games tab** | Every detected game is a tile. **Play** launches it. Untick **Show on Discord** to hide a game. Right-click a tile for *Create desktop shortcut* or *Open install folder*. |
 | **Missing a game?** | Click **+ Add game** and pick its `.exe`, or add a folder in **Settings** (each sub-folder counts as a game), then **Rescan**. |
-| **Music & Apps tab** | Turn Apple Music, lyrics, album art and the "current app" card on or off. |
+| **Music & Apps tab** | Turn Apple Music, Spotify, lyrics, album art and the "current app" card on or off. |
 | **Custom status tab** | Make your own cards with your own text, pictures and buttons. See [Custom status](#custom-status-windows). |
 | **Settings tab** | Optional Genshin UID, extra game folders, start with Windows, tray behavior. |
 | **Log tab** | What the app is doing, which is handy if something looks off. |
@@ -144,7 +144,7 @@ This reads your public profile from [Enka.Network](https://enka.network) (no log
 | Card | What triggers it |
 |---|---|
 | **Game** | A process from your library is running. Uses that game's official Discord app if Discord has one, otherwise a generic "game" card. |
-| **Music** | The Microsoft Store **Apple Music** app is playing. |
+| **Music** | The Microsoft Store **Apple Music** app or the **Spotify** app is playing (Windows). If Discord also shows its own Spotify card, turn off "Display Spotify as your status" in Discord's Connections. |
 | **App** | You're focused on another program (VS Code, Chrome, ...). Kept for a few minutes when you alt-tab to Discord. |
 | **Custom** | Whichever custom statuses you ticked (Windows). |
 | **Watching** | A video is playing on Netflix, Hulu, Disney+, ... in your browser or their app (Windows). |
@@ -156,7 +156,7 @@ Discord shows one activity per Discord application, so each card uses its own ap
 Small unsigned tools that watch running programs and talk to Discord sometimes get flagged by heuristic scanners. This one isn't malware, and you don't have to take that on faith:
 
 - **The whole program is one readable file:** [`src/RichPresence.ps1`](src/RichPresence.ps1). The EXE is that script wrapped by [PS2EXE](https://github.com/MScholtes/PS2EXE), and PS2EXE-built files are a common false-positive target.
-- **What it does:** list running process names, read the focused window's title and your browsers' window titles, read the "now playing" info Windows shows in its media controls (Apple Music, and videos in browsers), and talk to the Discord app on your PC over its local pipe.
+- **What it does:** list running process names, read the focused window's title and your browsers' window titles, read the "now playing" info Windows shows in its media controls (Apple Music, Spotify, and videos in browsers), and talk to the Discord app on your PC over its local pipe.
 - **What it never does:** inject code, read or write game memory, modify game files, log keystrokes, or ask for passwords/tokens.
 - **Network calls:** `discord.com` (the public list of known games), `enka.network` (Genshin profile, optional), `itunes.apple.com` (album art), `lrclib.net` (lyrics), `google.com/s2/favicons` (app and streaming-service icons), `api.tvmaze.com` and `v3-cinemeta.strem.io` (show and movie posters, optional). Nothing is sent to the author.
 - **Verify or build it yourself:** releases are built by GitHub Actions from this repo, so you can [build it yourself](#build-it-yourself) and compare. You can also upload the EXE to [VirusTotal](https://www.virustotal.com) and see that the few flags, if any, are generic heuristics from PS2EXE.
@@ -166,7 +166,7 @@ Small unsigned tools that watch running programs and talk to Discord sometimes g
 Every release EXE is built by GitHub Actions from this repo and comes with a signed **build attestation**: proof of which commit and workflow produced that exact file. To check a download with the [GitHub CLI](https://cli.github.com):
 
 ```powershell
-gh attestation verify RichPresence.exe --repo noice912/RichPresence
+gh attestation verify RichPresence.exe --repo noice912/Discord-status
 ```
 
 If it prints `Verification succeeded`, the file is the one this repo built and nobody swapped it. You can also compare its SHA-256 with `Get-FileHash RichPresence.exe`.
@@ -178,8 +178,8 @@ RichPresence has **no telemetry, no accounts and no analytics**, and nothing is 
 | Request | What is sent | When |
 |---|---|---|
 | `discord.com` | Nothing about you. It downloads Discord's public list of known games (cached for 7 days). | On a scan |
-| `itunes.apple.com` | The song title, artist and album, to find album art | Apple Music card + "Show album art" on |
-| `lrclib.net` | The song title, artist, album and length, to find lyrics | Apple Music card + "Show the current lyric line" on |
+| `itunes.apple.com` | The song title, artist and album, to find album art | Music card (Apple Music or Spotify) + "Show album art" on |
+| `lrclib.net` | The song title, artist, album and length, to find lyrics | Music card (Apple Music or Spotify) + "Show the current lyric line" on |
 | `enka.network` | Your Genshin UID, to read your public profile | Only if you enter a UID in Settings |
 | `api.tvmaze.com`, `v3-cinemeta.strem.io` | The name of the show or movie you're watching, to find its poster | Watching card + "Show its poster" on |
 | `google.com/s2/favicons` | The website name of a recognised app (e.g. `code.visualstudio.com`), to get its icon | "Show the app I'm using" or "Show what I'm watching" on |
@@ -197,7 +197,8 @@ RichPresence is a single portable file with no installer. To remove it: untick *
 | Nothing shows on Discord | Use the Discord **desktop** app and turn on Activity Privacy. Then check the sidebar says **Presence on**. |
 | A game is missing | **+ Add game**, or add its folder in Settings, then **Rescan**. |
 | A game shows as a "generic game" | Discord doesn't have an official app for it. It still shows, just without its own icon. |
-| Music doesn't show | Only the Microsoft Store **Apple Music** app is supported (not old iTunes). |
+| Music doesn't show | On Windows, the Microsoft Store **Apple Music** app and the **Spotify** app are supported (not old iTunes). Check both are ticked under **Music & Apps**. |
+| Two Spotify cards | Discord is showing its own Spotify card too. Turn off "Display Spotify as your status" in Discord's Connections, or untick **Show Spotify** in RichPresence. |
 | Genshin shows no name | Turn on **Character Showcase** in-game and enter your UID in Settings. |
 | Play does nothing / asks for admin | Some launchers need admin. Right-click RichPresence → **Run as administrator**. |
 | Status lags | Discord limits how often activity can update. It can take a few seconds. |
@@ -205,7 +206,7 @@ RichPresence is a single portable file with no installer. To remove it: untick *
 ## Build it yourself
 
 ```powershell
-git clone https://github.com/noice912/RichPresence.git
+git clone https://github.com/noice912/Discord-status.git
 cd RichPresence
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
