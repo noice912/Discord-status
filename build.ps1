@@ -24,7 +24,7 @@ Invoke-ps2exe `
     -iconFile   (Join-Path $root 'assets\icon.ico') `
     -noConsole -STA `
     -title 'RichPresence' -product 'RichPresence' `
-    -description 'Genshin Impact launcher with Discord Rich Presence' `
+    -description 'Game library with Discord Rich Presence' `
     -version "$ver.0"
 
 Write-Host "Built: $(Join-Path $dist 'RichPresence.exe')"

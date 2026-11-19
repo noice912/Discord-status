@@ -3,7 +3,7 @@
 
   Finds the games installed on your PC (Steam, Epic, GOG, Riot, HoYoPlay, Xbox, your own folders),
   matches each one to its official Discord app, and shows "Playing <game>" while it runs.
-  Also shows Apple Music (with lyrics) and Genshin Impact stats (name, AR, UID, WL).
+  Also shows Apple Music and Spotify (with lyrics) and Genshin Impact stats (name, AR, UID, WL).
 
   Run as a script:  powershell -ExecutionPolicy Bypass -File RichPresence.ps1
   Or compile it:    .\build.ps1   ->  dist\RichPresence.exe
@@ -32,8 +32,8 @@ $DefaultMusicId = '1552437427828818050'   # "RP 3" - Apple Music card
 $DefaultAppId   = '1544831111128154213'   # "Playing" - current-app card
 # built-in apps that custom statuses can borrow when the user hasn't made their own Discord app (one card each)
 $CustomPoolIds  = @('1553178514365358100', '1553247468957990943')
-$RepoUrl      = 'https://github.com/noice912/RichPresence'
-$AppVersion   = '1.6.0'     # build.ps1 reads this; bump it for every release
+$RepoUrl      = 'https://github.com/noice912/Discord-status'
+$AppVersion   = '2.1.6'     # build.ps1 reads this; bump it for every release
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
 # ===========================================================================
@@ -42,8 +42,9 @@ if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Fo
 function New-DefaultSettings {
     [ordered]@{
         genshin_uid            = ''
-        show_music             = $true
-        show_lyrics            = $true
+        show_music             = $true      # Apple Music
+        show_spotify           = $true      # Spotify, on the same card
+        show_lyrics           = $true
         show_album_art         = $true
         show_current_app       = $true
         show_watching          = $true      # Netflix, Hulu, Disney+, ... playing in a browser or their Windows app
@@ -296,6 +297,7 @@ $Engine = {
     $AppId      = "$($S.app_client_id)".Trim()
     $GenshinUid = "$($S.genshin_uid)".Trim()
     $ShowMusic  = [bool]$S.show_music
+    $ShowSpotify = [bool]$S.show_spotify
     $ShowLyrics = [bool]$S.show_lyrics
     $ShowArt    = [bool]$S.show_album_art
     $ShowApps   = [bool]$S.show_current_app
@@ -316,21 +318,33 @@ $Engine = {
     })[0]
     function Await($op, $resultType) {
         $t = $asTaskGeneric.MakeGenericMethod($resultType).Invoke($null, @($op))
-        $t.Wait(-1) | Out-Null
+        if (-not $t.Wait(5000)) { throw "Windows media controls didn't answer in time." }
         $t.Result
     }
     [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType = WindowsRuntime] | Out-Null
     $SmtcType  = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]
     $PropsType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties]
 
-    function Get-AppleMusicSession {
+    # the music player to show: Apple Music and/or Spotify, whichever is playing.
+    # Both playing: the one Windows calls current, else Apple Music. Neither playing: the first one found.
+    function Get-MusicSession {
         $mgr = Await ($SmtcType::RequestAsync()) $SmtcType
-        $apple = @($mgr.GetSessions()) | Where-Object { $_.SourceAppUserModelId -match 'AppleMusic|AppleInc' } | Select-Object -First 1
-        if (-not $apple) {
-            $cur = $mgr.GetCurrentSession()
-            if ($cur -and $cur.SourceAppUserModelId -match 'AppleMusic|AppleInc') { $apple = $cur }
+        $cands = @()
+        foreach ($s in @($mgr.GetSessions())) {
+            $aum = "$($s.SourceAppUserModelId)"
+            if ($ShowMusic -and $aum -match 'AppleMusic|AppleInc') { $cands += @{ Session = $s; Player = 'Apple Music' } }
+            elseif ($ShowSpotify -and $aum -match '^Spotify\.exe$|SpotifyAB\.SpotifyMusic') { $cands += @{ Session = $s; Player = 'Spotify' } }
         }
-        return $apple
+        if (-not $cands.Count) { return $null }
+        $playing = @($cands | Where-Object { "$($_.Session.GetPlaybackInfo().PlaybackStatus)" -eq 'Playing' })
+        if ($playing.Count -eq 1) { return $playing[0] }
+        if ($playing.Count -gt 1) {
+            $cur = $mgr.GetCurrentSession()
+            if ($cur) { foreach ($c in $playing) { if ("$($c.Session.SourceAppUserModelId)" -eq "$($cur.SourceAppUserModelId)") { return $c } } }
+            foreach ($c in $playing) { if ($c.Player -eq 'Apple Music') { return $c } }
+            return $playing[0]
+        }
+        return $cands[0]
     }
 
     $ArtCache = @{}; $LyricsCache = @{}
@@ -348,7 +362,7 @@ $Engine = {
         return $url
     }
     function Get-SyncedLyrics($artist, $title, $album, $durationSec) {
-        if (-not $ShowLyrics) { return $null }
+        if (-not $ShowLyrics -or -not "$artist".Trim()) { return $null }     # no artist (a podcast, an ad): nothing to look up
         $key = "$artist|$title|$album"
         if ($LyricsCache.ContainsKey($key)) { return $LyricsCache[$key] }
         $parsed = $null
@@ -531,11 +545,18 @@ public static class RPWin {
             if ($i -gt 0 -and $pids.ContainsKey([int]$_.Substring(0, $i))) { $_.Substring($i + 1) }
         })
     }
-    # what the browser extension last reported for a service (only if it's recent)
+    # what the browser extension last reported for a service (only if it's recent). Every tab reports
+    # separately: a playing tab wins over a paused one, then the newest report.
     function Get-ExtReport($name) {
-        $e = $Sync.Ext[$name]
-        if ($e -and ([datetime]::UtcNow - $e.At).TotalSeconds -lt 15) { return $e }
-        $null
+        $best = $null
+        $tabs = $Sync.Ext[$name]
+        if ($tabs) {
+            foreach ($e in @($tabs.Values)) {
+                if (([datetime]::UtcNow - $e.At).TotalSeconds -ge 15) { continue }
+                if (-not $best -or ($e.Playing -and -not $best.Playing) -or ($e.Playing -eq $best.Playing -and $e.At -gt $best.At)) { $best = $e }
+            }
+        }
+        $best
     }
     function Find-Watching {
         # the browser extension reads the player itself, so it knows best: show, episode, exact position
@@ -687,19 +708,32 @@ public static class RPWin {
         [BitConverter]::GetBytes([int32]$data.Length).CopyTo($header, 4)
         $c.Pipe.Write($header, 0, 8); $c.Pipe.Write($data, 0, $data.Length); $c.Pipe.Flush()
     }
+    # one read from the pipe that never waits longer than 5 s. 0 = Discord closed the pipe, or went quiet
+    # (then the pipe is dropped, because a late answer would be mistaken for the next one)
+    function Read-Pipe($c, $buf, $off, $count) {
+        $t = $c.Pipe.ReadAsync($buf, $off, $count)
+        if (-not $t.Wait(5000)) { Close-Discord $c; return 0 }
+        $t.Result
+    }
     function Read-Frame($c) {
         try {
             $h = New-Object byte[] 8
-            if ($c.Pipe.Read($h, 0, 8) -lt 8) { return $null }
+            if ((Read-Pipe $c $h 0 8) -lt 8) { return $null }
             $len = [BitConverter]::ToInt32($h, 4)
             if ($len -le 0) { return '' }
             $b = New-Object byte[] $len; $g = 0
-            while ($g -lt $len) { $g += $c.Pipe.Read($b, $g, $len - $g) }
+            while ($g -lt $len) { $n = Read-Pipe $c $b $g ($len - $g); if ($n -le 0) { return $null }; $g += $n }
             [Text.Encoding]::UTF8.GetString($b)
         } catch { $null }
     }
+    # Discord answers the handshake with READY. Anything else means it refused this app ID: say so once
+    # and leave that ID alone for a minute, instead of reconnecting every few seconds.
+    $BadIds = @{}     # discord app id -> @{ Until; Logged }
     function Connect-Discord($c) {
         if ($c.Pipe -and $c.Pipe.IsConnected) { return $true }
+        $bad = $BadIds[$c.ClientId]
+        if ($bad -and [datetime]::UtcNow -lt $bad.Until) { return $false }
+        $refused = $null
         foreach ($i in 0..9) {
             $p = $null
             try {
@@ -707,9 +741,20 @@ public static class RPWin {
                 $p.Connect(1000)
                 $c.Pipe = $p
                 Send-Frame $c 0 (@{ v = 1; client_id = $c.ClientId } | ConvertTo-Json -Compress)
-                Read-Frame $c | Out-Null
-                return $true
+                $r = Read-Frame $c
+                if ($r -and $r -match '"evt"\s*:\s*"READY"') { $BadIds.Remove($c.ClientId); return $true }
+                $p.Dispose(); $c.Pipe = $null
+                if ($r) { $refused = $r; break }
             } catch { if ($p) { $p.Dispose() }; $c.Pipe = $null }
+        }
+        if ($refused) {
+            if (-not $bad) {
+                $why = ''; try { $why = "$(($refused | ConvertFrom-Json).message)" } catch {}
+                Log ("Discord didn't accept the $($c.Name) card's app ID $($c.ClientId)" + $(if ($why) { " ($why)" } else { '' }) + ". Trying again once a minute.")
+                $bad = @{ Until = [datetime]::UtcNow }
+                $BadIds[$c.ClientId] = $bad
+            }
+            $bad.Until = [datetime]::UtcNow.AddSeconds(60)
         }
         return $false
     }
@@ -911,26 +956,23 @@ public static class RPWin {
     Log "Presence started."
     while (-not $Sync.Stop) {
         try {
-            if (-not (Test-DiscordRunning)) {
-                $Sync.Status = 'Waiting for Discord...'
-                Close-Discord $ConnMusic; Close-Discord $ConnApp; Close-CustomConns; if ($ConnWatch) { Close-Discord $ConnWatch; $ConnWatch = $null }
-                foreach ($k in @($GameConns.Keys)) { Close-Discord $GameConns[$k] }; $GameConns = @{}
-                Nap 8; continue
-            }
-
-            # ---- which library games are running?
+            # ---- which library games are running? Every game counts here, with or without Discord
+            # ("never update while a game runs", "quit when the game closes"); only the ones switched on get a card.
             $procs = @{}
             foreach ($p in Get-Process) { $procs[$p.ProcessName.ToLower()] = $p }
             $script:GameExeSet = @{}
-            $running = @()
+            $running = @(); $runIds = @()
             foreach ($g in @($Sync.Games)) {
                 foreach ($e in @($g.exes)) { $script:GameExeSet["$e"] = $true }
-                if (-not $g.enabled) { continue }
                 foreach ($e in @($g.exes)) {
-                    if ($procs.ContainsKey("$e")) { $running += [pscustomobject]@{ G = $g; P = $procs["$e"] }; break }
+                    if ($procs.ContainsKey("$e")) {
+                        $runIds += $g.id
+                        if ($g.enabled) { $running += [pscustomobject]@{ G = $g; P = $procs["$e"] } }
+                        break
+                    }
                 }
             }
-            $Sync.RunningIds = @($running | ForEach-Object { $_.G.id })
+            $Sync.RunningIds = $runIds
 
             # "quit when the game closes" - only for the game we launched
             if ($Sync.WatchId) {
@@ -943,19 +985,29 @@ public static class RPWin {
                 elseif (([datetime]::UtcNow - $watchStarted).TotalMinutes -gt 10) { $Sync.WatchId = $null }
             }
 
+            if (-not (Test-DiscordRunning)) {
+                $Sync.Status = 'Waiting for Discord...'
+                Close-Discord $ConnMusic; Close-Discord $ConnApp; Close-CustomConns; if ($ConnWatch) { Close-Discord $ConnWatch; $ConnWatch = $null }
+                foreach ($k in @($GameConns.Keys)) { Close-Discord $GameConns[$k] }; $GameConns = @{}
+                Nap 8; continue
+            }
+
             # ================= CARD 1: the game =================
             Update-GameCards $running
 
-            # ================= CARD 2: Apple Music =================
+            # ================= CARD 2: music (Apple Music or Spotify) =================
             $musicActive = $false
-            if ($ShowMusic) {
-                $session = Get-AppleMusicSession
+            if ($ShowMusic -or $ShowSpotify) {
+                $music = Get-MusicSession
+                $session = $null; $player = ''
+                if ($music) { $session = $music.Session; $player = $music.Player }
                 $status = $null; $title = $null; $artist = $null; $album = $null; $position = 0; $duration = 0
                 if ($session) {
                     $status = "$($session.GetPlaybackInfo().PlaybackStatus)"
                     $props  = Await ($session.TryGetMediaPropertiesAsync()) $PropsType
                     $title  = "$($props.Title)".Trim(); $artist = "$($props.Artist)".Trim(); $album = "$($props.AlbumTitle)".Trim()
-                    if ([string]::IsNullOrWhiteSpace($album) -and $artist) {
+                    # Apple Music puts "artist - album" in the artist field
+                    if ($player -eq 'Apple Music' -and [string]::IsNullOrWhiteSpace($album) -and $artist) {
                         $dashes = ([char]0x2012, [char]0x2013, [char]0x2014, [char]0x2015) -join '|'
                         $m = [regex]::Match(($artist -replace $dashes, '-'), '^(.+?)\s+-\s+(.+)$')
                         if ($m.Success) { $artist = $m.Groups[1].Value.Trim(); $album = $m.Groups[2].Value.Trim() }
@@ -971,7 +1023,7 @@ public static class RPWin {
             if ($musicActive -and (Connect-Discord $ConnMusic)) {
                 $lyrics  = Get-SyncedLyrics $artist $title $album $duration
                 $curLine = Get-CurrentLyricLine $lyrics $position
-                $id = "music|$artist|$title|$album"
+                $id = "music|$player|$artist|$title|$album"
                 $trackChanged = ($ConnMusic.Id -ne $id)
                 $lyricChanged = ($ShowLyrics -and $curLine -and $curLine -ne $lastLyricLine)
                 if ($trackChanged -or $lyricChanged -or (([datetime]::UtcNow - $ConnMusic.SentUtc).TotalSeconds -ge 15)) {
@@ -979,14 +1031,15 @@ public static class RPWin {
                     $startMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]([math]::Round($position * 1000))
                     $activity = @{
                         type = 2; details = $title
-                        state = if ($ShowLyrics -and $curLine) { $curLine } else { "by $artist" }
                         assets = @{ large_image = $(if ($art) { $art } else { $FALLBACK_IMAGE }); large_text = $(if ($album) { "$title - $album" } else { $title }) }
                         timestamps = @{ start = $startMs }
                     }
+                    # the lyric line, else the artist; a podcast or an ad has neither
+                    if ($ShowLyrics -and $curLine) { $activity.state = $curLine } elseif ($artist) { $activity.state = "by $artist" }
                     if ($artist) { $activity.name = $artist }
                     if ($duration -gt 0) { $activity.timestamps.end = $startMs + [int64]([math]::Round($duration * 1000)) }
                     if (Push-Card $ConnMusic $activity $id $trackChanged) {
-                        if ($trackChanged) { Log "Music: $artist - $title"; $lastLyricLine = $null }
+                        if ($trackChanged) { Log "Music ($player): $artist - $title"; $lastLyricLine = $null }
                         if ($lyricChanged) { $lastLyricLine = $curLine }
                     }
                 }
@@ -1104,7 +1157,7 @@ $Updater = {
     function Log($m) { $Sync.Queue.Enqueue(("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m)) }
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/noice912/RichPresence/releases/latest' -Headers @{ 'User-Agent' = 'RichPresence updater' } -TimeoutSec 20
+        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/noice912/Discord-status/releases/latest' -Headers @{ 'User-Agent' = 'RichPresence updater' } -TimeoutSec 20
         $latest = "$($rel.tag_name)".TrimStart('v')
         $Sync.LatestVersion = $latest
         if ([version]$latest -le [version]$Current) { $Sync.UpdateState = 'current'; return }
@@ -1119,6 +1172,7 @@ $Updater = {
         $want = "$($asset.digest)" -replace '^sha256:', ''
         if (-not $want) { Remove-Item $file -Force; Log "Update $latest has no published checksum, so it wasn't installed."; $Sync.UpdateState = 'failed'; return }
         if ($hash -ne $want.ToLower()) { Remove-Item $file -Force; Log "Update $latest didn't match its checksum and was deleted."; $Sync.UpdateState = 'failed'; return }
+        $Sync.UpdateHash = $want.ToLower()      # checked again just before installing
         $Sync.UpdateFile = $file
         $Sync.UpdateState = 'ready'
         Log "Update $latest downloaded and verified."
@@ -1150,6 +1204,19 @@ $Bridge = {
         $stream.Write($h, 0, $h.Length); if ($b.Length) { $stream.Write($b, 0, $b.Length) }
     }
     function Clip($v, $n) { $t = ("$v" -replace '[\r\n\t]+', ' ').Trim(); if ($t.Length -gt $n) { $t = $t.Substring(0, $n) }; $t }
+    # every tab of a service reports separately: a playing tab wins over a paused one, then the newest report
+    # (the same choice as the engine's Get-ExtReport)
+    function Select-Report($tabs, $maxAge) {
+        $best = $null
+        if ($tabs) {
+            foreach ($e in @($tabs.Values)) {
+                if (([datetime]::UtcNow - $e.At).TotalSeconds -ge $maxAge) { continue }
+                if (-not $best -or ($e.Playing -and -not $best.Playing) -or ($e.Playing -eq $best.Playing -and $e.At -gt $best.At)) { $best = $e }
+            }
+        }
+        $best
+    }
+    $Logged = @{}     # service -> the "title|episode" last written to the log
 
     $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port)
     try { $listener.Start() } catch { Log "Browser extension link unavailable (port $Port is busy)."; return }
@@ -1181,8 +1248,8 @@ $Bridge = {
 
                 if ($method -eq 'GET' -and $path -eq '/status') {
                     $list = @(foreach ($k in @($Sync.Ext.Keys)) {
-                        $e = $Sync.Ext[$k]
-                        if (([datetime]::UtcNow - $e.At).TotalSeconds -lt 30) { @{ service = $k; title = $e.Title; episode = $e.Episode; playing = $e.Playing } }
+                        $e = Select-Report $Sync.Ext[$k] 30
+                        if ($e) { @{ service = $k; title = $e.Title; episode = $e.Episode; playing = $e.Playing } }
                     })
                     Send-Response $stream 200 'OK' (@{ app = 'RichPresence'; version = $Version; watching = $list } | ConvertTo-Json -Depth 4 -Compress) $allow
                     continue
@@ -1197,16 +1264,28 @@ $Bridge = {
                     $j = [Text.Encoding]::UTF8.GetString($body, 0, $have) | ConvertFrom-Json
                     $svc = "$($j.service)"
                     if ($svc -notin $ExtServices) { Send-Response $stream 400 'Bad Request' '' $allow; continue }
-                    $pos = 0.0; $dur = 0.0; [void][double]::TryParse("$($j.position)", [ref]$pos); [void][double]::TryParse("$($j.duration)", [ref]$dur)
+                    # an older extension sends no tab id: all its tabs share one slot, as before
+                    $tab = "$($j.tab)"
+                    if ($tab -notmatch '^[\w-]{1,64}$') { $tab = 'default' }
+                    # numbers always arrive with a dot, whatever this PC's language is
+                    $pos = 0.0; $dur = 0.0; $num = [Globalization.NumberStyles]::Float; $inv = [Globalization.CultureInfo]::InvariantCulture
+                    [void][double]::TryParse("$($j.position)", $num, $inv, [ref]$pos); [void][double]::TryParse("$($j.duration)", $num, $inv, [ref]$dur)
                     # a thumbnail is only taken from the sites' own image servers
                     $img = "$($j.image)".Trim()
                     if ($img -notmatch '^https://(i\.ytimg\.com/vi/[\w-]{6,20}/\w+\.jpg|static-cdn\.jtvnw\.net/previews-ttv/live_user_\w{3,25}-\d+x\d+\.jpg)$') { $img = '' }
                     $new = @{ Title = (Clip $j.title 128); Episode = (Clip $j.episode 128); Image = $img; Playing = [bool]$j.playing; Pos = $pos; Dur = $dur; At = [datetime]::UtcNow }
+                    # a fresh table every time (the engine may be reading the old one), without tabs gone quiet for a minute
+                    $tabs = @{}
                     $old = $Sync.Ext[$svc]
-                    if ($new.Playing -and $new.Title -and (-not $old -or $old.Title -ne $new.Title -or $old.Episode -ne $new.Episode)) {
-                        Log ("Browser extension: {0} - {1}{2}" -f $svc, $new.Title, $(if ($new.Episode) { " - $($new.Episode)" } else { '' }))
+                    if ($old) { foreach ($k in @($old.Keys)) { if (([datetime]::UtcNow - $old[$k].At).TotalSeconds -lt 60) { $tabs[$k] = $old[$k] } } }
+                    $tabs[$tab] = $new
+                    $Sync.Ext[$svc] = $tabs
+                    # log the report that is shown, when it changes (not every tab's every report)
+                    $pick = Select-Report $tabs 15
+                    if ($pick -and $pick.Playing -and $pick.Title -and $Logged[$svc] -ne "$($pick.Title)|$($pick.Episode)") {
+                        $Logged[$svc] = "$($pick.Title)|$($pick.Episode)"
+                        Log ("Browser extension: {0} - {1}{2}" -f $svc, $pick.Title, $(if ($pick.Episode) { " - $($pick.Episode)" } else { '' }))
                     }
-                    $Sync.Ext[$svc] = $new
                     Send-Response $stream 204 'No Content' '' $allow
                     continue
                 }
@@ -1224,8 +1303,8 @@ function New-Sync {
     [hashtable]::Synchronized(@{
         Stop = $false; Queue = (New-Object System.Collections.Concurrent.ConcurrentQueue[string])
         Status = 'Stopped'; Games = @(); RunningIds = @(); WatchId = $null; GameExited = $false; ScanDone = $false; AppLabel = ''
-        UpdateState = ''; UpdateFile = $null; LatestVersion = ''; Custom = @{ Mode = 'separate'; Items = @() }
-        Ext = [hashtable]::Synchronized(@{}); BridgeStop = $false     # what the browser extension reports, per service
+        UpdateState = ''; UpdateFile = $null; UpdateHash = ''; LatestVersion = ''; Custom = @{ Mode = 'separate'; Items = @() }
+        Ext = [hashtable]::Synchronized(@{}); BridgeStop = $false     # what the browser extension reports: service -> (tab -> report)
     })
 }
 function Start-Block($block, $arguments) {
@@ -1240,7 +1319,28 @@ function Stop-Block($job, $sync, $wait) {
     if (-not $job) { return }
     if ($sync) { $sync.Stop = $true }
     if ($wait) { [void]$job.Handle.AsyncWaitHandle.WaitOne($wait) }
+    # Disposing a block that is still busy waits for it to stop, however long that takes:
+    # hand that to a thread-pool thread so the window never freezes on it.
+    if (-not $job.Handle.IsCompleted) {
+        try {
+            if (-not ('RPReap' -as [type])) {
+                Add-Type 'using System; using System.Threading; public static class RPReap { public static void Later(IDisposable a, IDisposable b) { ThreadPool.QueueUserWorkItem(delegate { try { a.Dispose(); } catch {} try { b.Dispose(); } catch {} }); } }'
+            }
+            [RPReap]::Later($job.PS, $job.RS)
+            return
+        } catch {}
+    }
     try { $job.PS.Dispose(); $job.RS.Dispose() } catch {}
+}
+# what a finished block died of, if anything (errors outside its own try/catch end up here and nowhere else)
+function Get-BlockErrors($job) {
+    $out = @()
+    try {
+        foreach ($er in @($job.PS.Streams.Error)) { $out += "$er" }
+        $why = $job.PS.InvocationStateInfo.Reason
+        if ($why -and $out -notcontains "$($why.Message)") { $out += "$($why.Message)" }
+    } catch {}
+    $out
 }
 function Read-Library {
     if (-not (Test-Path $LibraryPath)) { return @() }
@@ -1275,7 +1375,7 @@ if ($Headless) {
         while ($true) {
             $line = $null
             while ($sync.Queue.TryDequeue([ref]$line)) { Write-Host $line }
-            if ($job.Handle.IsCompleted) { break }
+            if ($job.Handle.IsCompleted) { foreach ($m in (Get-BlockErrors $job)) { Write-Host "Presence stopped with an error: $m" }; break }
             Start-Sleep -Milliseconds 300
         }
     } finally { Stop-Block $job $sync 8000; $sync.BridgeStop = $true; Stop-Block $bridgeJob $null 2000 }
@@ -1285,18 +1385,28 @@ if ($Headless) {
 # ===========================================================================
 # Window
 # ===========================================================================
+$PlayRequestPath = Join-Path $DataDir 'play.request'     # a game id handed over by a second "-Play <id>" launch
 $mutex = New-Object System.Threading.Mutex($false, 'Local\RichPresenceLauncher')
 if (-not $mutex.WaitOne(0)) {
+    if ($Play) {
+        # a desktop shortcut while RichPresence is already open: pass the game to the running one and leave quietly
+        try {
+            [IO.File]::WriteAllText("$PlayRequestPath.tmp", $Play, (New-Object System.Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath "$PlayRequestPath.tmp" -Destination $PlayRequestPath -Force
+        } catch {}
+        exit
+    }
     [System.Windows.Forms.MessageBox]::Show('RichPresence is already running - check your system tray.', 'RichPresence') | Out-Null
     exit
 }
+try { Remove-Item -LiteralPath $PlayRequestPath -Force } catch {}     # a request left over from last time is stale
 [System.Windows.Forms.Application]::EnableVisualStyles()
 # the custom status preview loads picture links itself
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $Settings = Load-Settings
 $Sync     = New-Sync
-$script:Job = $null; $script:ScanJob = $null
+$script:Job = $null; $script:ScanJob = $null; $script:RescanPending = $false
 $script:Library = @(Read-Library)
 $script:Tiles = @{}
 $script:reallyQuit = $false
@@ -1382,16 +1492,18 @@ $mTitle = New-Ctl System.Windows.Forms.Label $pMusic @{ Text = 'Music, video & a
 $mNote = New-Ctl System.Windows.Forms.Label $pMusic @{ Text = "These show as their own Discord cards next to your game. Apple Music: use the Microsoft Store app.`nWatching works in Chrome, Edge, Firefox, Brave, Opera and the services' Windows apps. Each service shows as its own card with its logo (Plex, YouTube and Twitch use the app card)."; ForeColor = $cDim; Location = (Pt 22 58); AutoSize = $true }
 function New-Check($parent, $text, $y) { New-Ctl System.Windows.Forms.CheckBox $parent @{ Text = $text; Location = (Pt 24 $y); AutoSize = $true; ForeColor = $cText } }
 $chkMusic  = New-Check $pMusic 'Show what I''m playing on Apple Music' 110
-$chkLyrics = New-Check $pMusic 'Show the current lyric line' 138
-$chkArt    = New-Check $pMusic 'Show album art' 166
-$chkApps   = New-Check $pMusic 'Show the app I''m using when nothing else is showing' 194
-$chkWatch  = New-Check $pMusic 'Show what I''m watching (Netflix, Hulu, Disney+, Prime Video, Max and more)' 230
-$chkWatchTitle  = New-Check $pMusic 'Show the show or movie name' 258
-$chkWatchPoster = New-Check $pMusic 'Show its poster (looked up on TVMaze and Cinemeta)' 286
-$chkWatchCasual = New-Check $pMusic 'Also YouTube and Twitch' 314
+$chkSpotify = New-Check $pMusic 'Show Spotify (with lyrics)' 138
+$spotifyHint = New-Ctl System.Windows.Forms.Label $pMusic @{ Text = 'If Discord also shows its own Spotify card, turn off "Display Spotify as your status" in Discord''s Connections.'; UseMnemonic = $false; ForeColor = $cDim; Font = $fSmall; Location = (Pt 42 160); Size = (Sz 560 30) }
+$chkLyrics = New-Check $pMusic 'Show the current lyric line' 196
+$chkArt    = New-Check $pMusic 'Show album art' 224
+$chkApps   = New-Check $pMusic 'Show the app I''m using when nothing else is showing' 252
+$chkWatch  = New-Check $pMusic 'Show what I''m watching (Netflix, Hulu, Disney+, Prime Video, Max and more)' 288
+$chkWatchTitle  = New-Check $pMusic 'Show the show or movie name' 316
+$chkWatchPoster = New-Check $pMusic 'Show its poster (looked up on TVMaze and Cinemeta)' 344
+$chkWatchCasual = New-Check $pMusic 'Also YouTube and Twitch' 372
 foreach ($c in $chkWatchTitle, $chkWatchPoster, $chkWatchCasual) { $c.Left = 44 }
 $chkWatch.add_CheckedChanged({ foreach ($c in $chkWatchTitle, $chkWatchPoster, $chkWatchCasual) { $c.Enabled = $chkWatch.Checked } })
-$btnMusicSave = New-Ctl System.Windows.Forms.Button $pMusic @{ Text = 'Apply'; Location = (Pt 24 360); Size = (Sz 100 32) }
+$btnMusicSave = New-Ctl System.Windows.Forms.Button $pMusic @{ Text = 'Apply'; Location = (Pt 24 418); Size = (Sz 100 32) }
 Style-Button $btnMusicSave $true
 
 # ---- Custom status page: a list of your own cards on the left, the selected one's editor on the right
@@ -1473,6 +1585,7 @@ function Apply-ToUi {
     $txtUid.Text = "$($Settings.genshin_uid)"
     $txtFolders.Text = (@($Settings.extra_folders) -join [Environment]::NewLine)
     $chkMusic.Checked = [bool]$Settings.show_music; $chkLyrics.Checked = [bool]$Settings.show_lyrics
+    $chkSpotify.Checked = [bool]$Settings.show_spotify
     $chkArt.Checked = [bool]$Settings.show_album_art; $chkApps.Checked = [bool]$Settings.show_current_app
     $chkWatch.Checked = [bool]$Settings.show_watching; $chkWatchTitle.Checked = [bool]$Settings.show_watch_title
     $chkWatchPoster.Checked = [bool]$Settings.show_watch_poster; $chkWatchCasual.Checked = [bool]$Settings.show_watch_casual
@@ -1486,6 +1599,7 @@ function Read-FromUi {
     $Settings.genshin_uid = $txtUid.Text.Trim()
     $Settings.extra_folders = @($txtFolders.Text -split "`r?`n" | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
     $Settings.show_music = $chkMusic.Checked; $Settings.show_lyrics = $chkLyrics.Checked
+    $Settings.show_spotify = $chkSpotify.Checked
     $Settings.show_album_art = $chkArt.Checked; $Settings.show_current_app = $chkApps.Checked
     $Settings.show_watching = $chkWatch.Checked; $Settings.show_watch_title = $chkWatchTitle.Checked
     $Settings.show_watch_poster = $chkWatchPoster.Checked; $Settings.show_watch_casual = $chkWatchCasual.Checked
@@ -1531,7 +1645,9 @@ function Stop-Presence {
     $btnToggle.Text = 'Start presence'; $btnToggle.Enabled = $true; $form.Cursor = 'Default'
 }
 function Start-Scan {
-    if ($script:ScanJob -and -not $script:ScanJob.Handle.IsCompleted) { return }
+    # asked during a scan (Add game, Save & rescan, Remove): scan again as soon as this one ends
+    if ($script:ScanJob -and -not $script:ScanJob.Handle.IsCompleted) { $script:RescanPending = $true; return }
+    $script:RescanPending = $false
     if ($script:ScanJob) { Stop-Block $script:ScanJob $null 0 }
     $Sync.ScanDone = $false
     $emptyLbl.Visible = ($script:Library.Count -eq 0)
@@ -1695,17 +1811,23 @@ function Get-TileImage($g) {
         if ($g.art -and (Test-Path $g.art)) {
             $bytes = [IO.File]::ReadAllBytes($g.art)
             $ms = New-Object IO.MemoryStream(, $bytes)
-            return (New-Object System.Drawing.Bitmap([System.Drawing.Image]::FromStream($ms)))
+            $src = $null
+            # the tile keeps its own copy, so the decoded picture and its stream can go right away
+            try { $src = [System.Drawing.Image]::FromStream($ms); return (New-Object System.Drawing.Bitmap($src)) }
+            finally { if ($src) { $src.Dispose() }; $ms.Dispose() }
         }
     } catch {}
+    $ico = $null; $icoBmp = $null; $gr = $null
     try {
         $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($g.icon)
+        $icoBmp = $ico.ToBitmap()
         $bmp = New-Object System.Drawing.Bitmap(210, 100)
         $gr = [System.Drawing.Graphics]::FromImage($bmp)
         $gr.Clear($cCardHi); $gr.InterpolationMode = 'HighQualityBicubic'
-        $gr.DrawImage($ico.ToBitmap(), 73, 18, 64, 64); $gr.Dispose()
+        $gr.DrawImage($icoBmp, 73, 18, 64, 64)
         return $bmp
     } catch { return $null }
+    finally { foreach ($d in $gr, $icoBmp, $ico) { if ($d) { $d.Dispose() } } }
 }
 
 function Add-Tile($g) {
@@ -1742,19 +1864,29 @@ function Add-Tile($g) {
     }
     $tile.ContextMenuStrip = $cm; $pic.ContextMenuStrip = $cm
     $flow.Controls.Add($tile)
-    $script:Tiles[$g.id] = [pscustomobject]@{ Tile = $tile; Sub = $sub; Game = $g }
+    $script:Tiles[$g.id] = [pscustomobject]@{ Tile = $tile; Sub = $sub; Game = $g; Pic = $pic; Menu = $cm }
 }
 
+# the search box only shows and hides the tiles that are already there
+function Filter-Tiles {
+    $q = $txtSearch.Text.Trim()
+    $flow.SuspendLayout()
+    foreach ($t in @($script:Tiles.Values)) { $t.Tile.Visible = (-not $q -or "$($t.Game.name)".IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0) }
+    $flow.ResumeLayout()
+}
+# builds every tile again: only needed when the library itself changed
 function Rebuild-Tiles {
     $flow.SuspendLayout()
+    # a tile's picture and its right-click menu aren't released with the tile itself
+    foreach ($t in @($script:Tiles.Values)) {
+        $img = $t.Pic.Image; $t.Pic.Image = $null
+        if ($img) { $img.Dispose() }
+        $t.Menu.Dispose()
+    }
     foreach ($c in @($flow.Controls)) { $c.Dispose() }
     $flow.Controls.Clear(); $script:Tiles = @{}
-    $q = $txtSearch.Text.Trim().ToLower()
-    $shown = 0
-    foreach ($g in $script:Library) {
-        if ($q -and $g.name.ToLower() -notlike "*$q*") { continue }
-        Add-Tile $g; $shown++
-    }
+    foreach ($g in $script:Library) { Add-Tile $g }
+    Filter-Tiles
     $flow.ResumeLayout()
     $gCount.Text = "$($script:Library.Count) games found"
     $emptyLbl.Visible = ($script:Library.Count -eq 0)
@@ -1793,7 +1925,7 @@ $btnAdd.add_Click({
         Save-Settings $Settings; Start-Scan
     }
 })
-$txtSearch.add_TextChanged({ Rebuild-Tiles })
+$txtSearch.add_TextChanged({ Filter-Tiles })
 
 # custom status page
 $lstC.add_SelectedIndexChanged({ if (-not $script:LoadingC -and $lstC.SelectedIndex -ne $script:CurC) { Load-CustomEditor } })
@@ -1871,22 +2003,73 @@ function Start-UpdateCheck {
     $script:UpdateJob = Start-Block $Updater @($Sync, $AppVersion, $DataDir)
     $script:NextUpdateCheck = (Get-Date).AddHours(6)
 }
+# "Never while a game is running": the engine reports the running games, but it may be off or only just
+# started, so look at the processes here too (at most every 5 seconds).
+$script:GameCheckAt = [datetime]::MinValue; $script:GameCheckHit = $false
+function Test-GameRunning {
+    if (@($Sync.RunningIds).Count) { return $true }
+    if (((Get-Date) - $script:GameCheckAt).TotalSeconds -lt 5) { return $script:GameCheckHit }
+    $hit = $false
+    try {
+        $names = @{}
+        foreach ($p in Get-Process) { $names[$p.ProcessName.ToLower()] = $true }
+        foreach ($g in $script:Library) { foreach ($e in @($g.exes)) { if ($names.ContainsKey("$e")) { $hit = $true } } }
+    } catch {}
+    $script:GameCheckAt = Get-Date; $script:GameCheckHit = $hit
+    $hit
+}
+# a version the helper couldn't copy into place (it notes it in update\failed.txt) isn't installed by
+# itself again; "Restart to update" still tries.
+$script:UpdateSkip = @{}
+function Test-UpdateFailed($ver) {
+    if (-not $script:UpdateSkip.ContainsKey("$ver")) {
+        $bad = $false
+        try {
+            $f = Join-Path $DataDir 'update\failed.txt'
+            if (Test-Path -LiteralPath $f) { $bad = (@(Get-Content -LiteralPath $f | ForEach-Object { "$_".Trim() }) -contains "$ver") }
+        } catch {}
+        if ($bad) { Append-Log ("[{0}] Update {1} couldn't be installed last time, so it won't install by itself. Use 'Restart to update' to try again." -f (Get-Date -Format 'HH:mm:ss'), $ver) }
+        $script:UpdateSkip["$ver"] = $bad
+    }
+    $script:UpdateSkip["$ver"]
+}
 # The running EXE can't overwrite itself: a tiny helper waits for this process to exit,
 # swaps the file in, and starts the new version.
 function Install-Update {
     $new = $Sync.UpdateFile
     if (-not $new -or -not (Test-Path $new)) { return }
     if (-not $IsExe) { $updateLbl.Text = "Version $($Sync.LatestVersion) is available on GitHub (running as a script, so update by hand)."; return }
+    # the file was checked when it was downloaded; check it again now, in case it was changed since
+    $ok = $false
+    try { $ok = [bool]("$($Sync.UpdateHash)" -and (Get-FileHash -LiteralPath $new -Algorithm SHA256).Hash.ToLower() -eq "$($Sync.UpdateHash)") } catch {}
+    if (-not $ok) {
+        try { Remove-Item -LiteralPath $new -Force } catch {}
+        $Sync.UpdateFile = $null; $Sync.UpdateState = 'failed'
+        Append-Log ("[{0}] Update {1} no longer matched its checksum and was deleted." -f (Get-Date -Format 'HH:mm:ss'), $Sync.LatestVersion)
+        return
+    }
     $helper = Join-Path (Split-Path $new) 'apply-update.cmd'
-    @"
+    $failed = Join-Path (Split-Path $new) 'failed.txt'
+    $ver = "$($Sync.LatestVersion)" -replace '[^\d.]', ''
+    # if the copy fails the helper notes the version in failed.txt, so it isn't tried again by itself, and reopens the old one
+    $cmd = @"
 @echo off
 :wait
 tasklist /FI "PID eq $PID" 2>nul | find "$PID" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
-copy /y "$new" "$SelfPath" >nul || goto done
+copy /y "$new" "$SelfPath" >nul
+if errorlevel 1 (
+  >"$failed" echo $ver
+  goto done
+)
 del "$new" >nul 2>&1
 :done
 start "" "$SelfPath"
-"@ | Set-Content -Path $helper -Encoding ASCII
+"@
+    # cmd.exe reads a .cmd in the PC's OEM code page, so a path with accented letters has to be written in it
+    $oem = [Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+    try { $oem = [int](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -ErrorAction Stop).OEMCP } catch {}
+    $enc = if ($oem -eq 65001) { New-Object System.Text.UTF8Encoding($false) } else { [Text.Encoding]::GetEncoding($oem) }
+    [IO.File]::WriteAllText($helper, ($cmd -replace "`r?`n", "`r`n"), $enc)
     Append-Log ("[{0}] Installing update {1} and restarting..." -f (Get-Date -Format 'HH:mm:ss'), $Sync.LatestVersion)
     Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$helper`"" -WindowStyle Hidden
     $script:reallyQuit = $true
@@ -1923,7 +2106,7 @@ $timer.add_Tick({
         'ready' {
             $updateLbl.Text = "Version $($Sync.LatestVersion) is ready"
             $btnUpdate.Text = 'Restart to update'
-            if ($Settings.auto_update -and @($Sync.RunningIds).Count -eq 0) { $Sync.UpdateState = 'installing'; Install-Update }
+            if ($Settings.auto_update -and -not (Test-UpdateFailed $Sync.LatestVersion) -and -not (Test-GameRunning)) { $Sync.UpdateState = 'installing'; Install-Update }
         }
     }
 
@@ -1938,10 +2121,31 @@ $timer.add_Tick({
             if ($g) { Play-Game $g }
         }
     }
+    if ($script:ScanJob -and $script:ScanJob.Handle.IsCompleted) {
+        # a scan that ended without finishing would leave the button on "Scanning..." for good
+        if (-not $Sync.ScanDone -and -not $btnRescan.Enabled) { $btnRescan.Text = 'Rescan'; $btnRescan.Enabled = $true }
+        if ($script:RescanPending) { Start-Scan }
+    }
+
+    # a second "-Play <id>" launch (a desktop shortcut) left a game to start. An id that isn't in the
+    # library, or a file that can't be read, is simply dropped.
+    if ([IO.File]::Exists($PlayRequestPath)) {
+        $want = ''
+        try { $want = "$([IO.File]::ReadAllText($PlayRequestPath))".Trim() } catch {}
+        try { Remove-Item -LiteralPath $PlayRequestPath -Force } catch {}
+        if ($want) {
+            $g = $script:Library | Where-Object { $_.id -eq $want } | Select-Object -First 1
+            if ($g) { Play-Game $g }
+            elseif ($script:ScanJob -and -not $script:ScanJob.Handle.IsCompleted) { $script:PendingPlay = $want }     # still looking for games
+        }
+    }
 
     if ($script:Job) {
         $statusLbl.Text = "Presence on`n$($Sync.Status)"; $statusLbl.ForeColor = $cGreen
-        if ($script:Job.Handle.IsCompleted) { Stop-Presence }
+        if ($script:Job.Handle.IsCompleted) {
+            foreach ($m in (Get-BlockErrors $script:Job)) { $Sync.Queue.Enqueue(("[{0}] Presence stopped with an error: {1}" -f (Get-Date -Format 'HH:mm:ss'), $m)) }
+            Stop-Presence
+        }
         if ($Settings.exit_when_game_closes -and $Sync.GameExited) { $script:reallyQuit = $true; $form.Close() }
     } else {
         $statusLbl.Text = 'Presence off'; $statusLbl.ForeColor = $cDim
