@@ -33,7 +33,7 @@ $DefaultAppId   = '1544831111128154213'   # "Playing" - current-app card
 # built-in apps that custom statuses can borrow when the user hasn't made their own Discord app (one card each)
 $CustomPoolIds  = @('1553178514365358100', '1553247468957990943')
 $RepoUrl      = 'https://github.com/noice912/Discord-status'
-$AppVersion   = '3.3.0'     # build.ps1 reads this; bump it for every release
+$AppVersion   = '3.3.1'     # build.ps1 reads this; bump it for every release
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
 # ===========================================================================
@@ -1974,10 +1974,43 @@ public class RPHotkey : NativeWindow, IDisposable {
 public static class RPKeys {
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     public static void Tap(byte vk) { keybd_event(vk, 0, 1, UIntPtr.Zero); keybd_event(vk, 0, 3, UIntPtr.Zero); }
+    // an ordinary key (Backspace, Enter): goes to whatever has the keyboard
+    public static void Press(byte vk) { keybd_event(vk, 0, 0, UIntPtr.Zero); keybd_event(vk, 0, 2, UIntPtr.Zero); }
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hgt, uint flags);
+    // shows a window on top without giving it the keyboard
+    public static void ShowQuiet(IntPtr h) { ShowWindow(h, 4); SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x0013); }   // no-activate; topmost, no move/size/activate
+    public static bool IsFront(IntPtr h) { return GetForegroundWindow() == h; }
+    // types text as characters, whatever the keyboard layout is (64-bit Windows only)
+    [StructLayout(LayoutKind.Explicit, Size = 40)] struct KeyInput {
+        [FieldOffset(0)] public uint Type; [FieldOffset(8)] public ushort Vk; [FieldOffset(10)] public ushort Scan;
+        [FieldOffset(12)] public uint Flags; [FieldOffset(16)] public uint Time; [FieldOffset(24)] public IntPtr Extra;
+    }
+    [DllImport("user32.dll")] static extern uint SendInput(uint count, KeyInput[] inputs, int size);
+    public static void Type(string text) {
+        if (string.IsNullOrEmpty(text) || IntPtr.Size != 8) return;
+        KeyInput[] k = new KeyInput[text.Length * 2];
+        for (int i = 0; i < text.Length; i++) {
+            k[2 * i].Type = 1; k[2 * i].Scan = text[i]; k[2 * i].Flags = 4;             // 4 = a character, not a key
+            k[2 * i + 1].Type = 1; k[2 * i + 1].Scan = text[i]; k[2 * i + 1].Flags = 6;  // ...and let go
+        }
+        SendInput((uint)k.Length, k, 40);
+    }
+}
+
+// A window that never takes the keyboard: the controller keyboard has to leave it with the text box you
+// are typing into.
+public class RPNoFocusForm : Form {
+    protected override bool ShowWithoutActivation { get { return true; } }
+    protected override CreateParams CreateParams {
+        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x08000000 | 0x00000080 | 0x00000008; return cp; }    // no-activate, tool window, topmost
+    }
 }
 
 // The controller: its logo button opens the overlay, and while the overlay is open the d-pad or left
-// stick moves around it, A / Cross picks and B / Circle closes. Xbox controllers are read through XInput,
+// stick moves around it, A / Cross picks and B / Circle closes. While Discord is showing (a web page, which
+// has nothing to move a frame between) the left stick is a mouse pointer instead: see Pointer below. Xbox controllers are read through XInput,
 // a DualSense or DualShock 4 from the controller's own reports. Works while a game has the keyboard.
 public class RPPad : NativeWindow, IDisposable {
     [StructLayout(LayoutKind.Sequential)] struct XState { public uint Packet; public ushort Buttons; public byte LT, RT; public short LX, LY, RX, RY; }
@@ -1986,14 +2019,33 @@ public class RPPad : NativeWindow, IDisposable {
     [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RawDevice[] devs, uint count, uint size);
     [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr input, uint cmd, IntPtr data, ref uint size, uint headerSize);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint GetRawInputDeviceInfo(IntPtr dev, uint cmd, StringBuilder data, ref uint size);
+    [StructLayout(LayoutKind.Sequential)] struct MousePoint { public int X, Y; }
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out MousePoint p);
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
 
     // what a controller is doing right now, packed into one number
     public const int LOGO = 1, ACCEPT = 2, BACK = 4, UP = 16, DOWN = 32, LEFT = 64, RIGHT = 128, DIRS = 240;
+    public const int SECOND = 256, KEYS = 512, ENTER = 1024;       // X / Square, Y / Triangle, Start / Options
 
     public event EventHandler Pressed;                      // the logo button went down
     public event EventHandler Moved;                        // a move, pick or back while Nav is on; which one is in Last
     public string Last = "";                                // "Up", "Down", "Left", "Right", "Accept", "Back"
     public bool Nav;                                        // the overlay is open: report moves
+    // Discord is showing: left stick = pointer, A / Cross = click (hold to drag), X / Square = right-click,
+    // right stick = scroll, d-pad = arrow keys, Start / Options = Enter. Y / Triangle and B / Circle are
+    // reported through Moved as "Keyboard" and "Back".
+    public bool Pointer;
+    // The controller keyboard is up: moves and buttons are reported through Moved (also "Second", "Keyboard",
+    // "Enter") and the pointer rests.
+    public bool Keys;
+    public float LX, LY, RX, RY;                            // the sticks right now, -1..1, up and right positive
+    public bool Dry;                                        // for checks: work everything out but don't touch the mouse or keys
+    public string Did = "";                                 // what the last Step did in pointer mode (for checks)
+    double moveX, moveY, wheel;
+    bool leftHeld, rightHeld;
+    readonly Dictionary<IntPtr, float[]> psSticks = new Dictionary<IntPtr, float[]>();
     public int Presses;                                     // how many times a logo button went down
     public string Seen = "";                                // the PlayStation controllers that have sent anything
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
@@ -2016,7 +2068,7 @@ public class RPPad : NativeWindow, IDisposable {
         RawDevice[] d = new RawDevice[2];
         for (int i = 0; i < 2; i++) { d[i].UsagePage = 1; d[i].Usage = (ushort)(i == 0 ? 5 : 4); d[i].Flags = want ? 0x100u : 1u; d[i].Target = want ? Handle : IntPtr.Zero; }
         RegisterRawInputDevices(d, 2, (uint)Marshal.SizeOf(typeof(RawDevice)));
-        psState.Clear(); was = 0;
+        psState.Clear(); psSticks.Clear(); was = 0;
         if (want) timer.Start(); else timer.Stop();
     }
 
@@ -2025,6 +2077,9 @@ public class RPPad : NativeWindow, IDisposable {
         if ((s.Buttons & 0x0400) != 0) v |= LOGO;
         if ((s.Buttons & 0x1000) != 0) v |= ACCEPT;
         if ((s.Buttons & 0x2000) != 0) v |= BACK;
+        if ((s.Buttons & 0x4000) != 0) v |= SECOND;
+        if ((s.Buttons & 0x8000) != 0) v |= KEYS;
+        if ((s.Buttons & 0x0010) != 0) v |= ENTER;
         if ((s.Buttons & 1) != 0 || s.LY > 20000) v |= UP;
         if ((s.Buttons & 2) != 0 || s.LY < -20000) v |= DOWN;
         if ((s.Buttons & 4) != 0 || s.LX < -20000) v |= LEFT;
@@ -2050,12 +2105,37 @@ public class RPPad : NativeWindow, IDisposable {
         if ((r[ps] & 1) != 0) v |= LOGO;
         if ((b & 0x20) != 0) v |= ACCEPT;                   // Cross
         if ((b & 0x40) != 0) v |= BACK;                     // Circle
+        if ((b & 0x10) != 0) v |= SECOND;                   // Square
+        if ((b & 0x80) != 0) v |= KEYS;                     // Triangle
+        if ((r[ps - 1] & 0x20) != 0) v |= ENTER;            // Options
         if (hat == 7 || hat == 0 || hat == 1 || r[stick + 1] < 50) v |= UP;
         if (hat == 3 || hat == 4 || hat == 5 || r[stick + 1] > 205) v |= DOWN;
         if (hat == 5 || hat == 6 || hat == 7 || r[stick] < 50) v |= LEFT;
         if (hat == 1 || hat == 2 || hat == 3 || r[stick] > 205) v |= RIGHT;
         return v;
     }
+
+    // A PlayStation controller's sticks from the same report: left x, left y, right x, right y (-1..1, up
+    // and right positive), or null when this report doesn't carry them.
+    public static float[] Sticks(int kind, byte[] r) {
+        if (r == null || r.Length < 8) return null;
+        int at;
+        if (kind == 1) { if (r[0] == 0x31) at = 2; else if (r[0] == 0x01) at = 1; else return null; }
+        else if (kind == 2) { if (r[0] == 0x11) at = 3; else if (r[0] == 0x01) at = 1; else return null; }
+        else return null;
+        if (at + 3 >= r.Length) return null;
+        return new float[] { (r[at] - 128) / 127f, -(r[at + 1] - 128) / 127f, (r[at + 2] - 128) / 127f, -(r[at + 3] - 128) / 127f };
+    }
+    // a stick's push -> how hard to move: nothing near the middle, gentle at first, fast at the edge
+    public static float Curve(float v) {
+        float a = Math.Abs(v);
+        if (a < 0.18f) return 0f;
+        float t = Math.Min(1f, (a - 0.18f) / 0.82f);
+        return (v < 0 ? -1f : 1f) * t * t;
+    }
+    static float Bigger(float a, float b) { return Math.Abs(b) > Math.Abs(a) ? b : a; }
+    void Mouse(uint flags, int data) { if (!Dry) mouse_event(flags, 0, 0, data, UIntPtr.Zero); }
+    void Key(byte vk) { if (!Dry) { keybd_event(vk, 0, 0, UIntPtr.Zero); keybd_event(vk, 0, 2, UIntPtr.Zero); } }
 
     void Say(string what) { Last = what; if (Moved != null) Moved(this, EventArgs.Empty); }
     static string DirName(int d) {
@@ -2064,16 +2144,22 @@ public class RPPad : NativeWindow, IDisposable {
     }
     void Poll() {
         int now = 0;
+        float lx = 0, ly = 0, rx = 0, ry = 0;
         if (xinput) {
             for (int i = 0; i < 4; i++) {
                 if (xSkip[i] > 0) { xSkip[i]--; continue; }     // an empty slot is slow to ask: look again in 2 seconds
                 XState s; int r;
                 try { r = XInputGetStateEx(i, out s); } catch { xinput = false; break; }
-                if (r != 0) { xSkip[i] = 50; continue; }
+                if (r != 0) { xSkip[i] = 2000 / timer.Interval; continue; }
                 now |= XButtons(s);
+                lx = Bigger(lx, s.LX / 32767f); ly = Bigger(ly, s.LY / 32767f); rx = Bigger(rx, s.RX / 32767f); ry = Bigger(ry, s.RY / 32767f);
             }
         }
         foreach (int v in psState.Values) now |= v;
+        foreach (float[] f in psSticks.Values) { lx = Bigger(lx, f[0]); ly = Bigger(ly, f[1]); rx = Bigger(rx, f[2]); ry = Bigger(ry, f[3]); }
+        LX = lx; LY = ly; RX = rx; RY = ry;
+        int want = Pointer ? 16 : 40;                       // a pointer has to be smooth
+        if (timer.Interval != want) timer.Interval = want;
         Step(now, DateTime.UtcNow);
     }
     // turns "what is held now" into presses; public so it can be driven without a controller
@@ -2084,7 +2170,48 @@ public class RPPad : NativeWindow, IDisposable {
             firedAt = at; Presses++;
             if (Pressed != null) Pressed(this, EventArgs.Empty);
         }
-        if (Nav) {
+        int gone = was & ~now;
+        if (Pointer && !Keys) {
+            Did = "";
+            float ax = Curve(LX), ay = Curve(LY);
+            if (ax != 0 || ay != 0) {
+                moveX += ax * 26; moveY -= ay * 26;         // up on the stick is up on the screen
+                int dx = (int)moveX, dy = (int)moveY;
+                if (dx != 0 || dy != 0) {
+                    moveX -= dx; moveY -= dy; Did += "move(" + dx + "," + dy + ") ";
+                    MousePoint p;
+                    if (!Dry && GetCursorPos(out p)) SetCursorPos(p.X + dx, p.Y + dy);
+                }
+            } else { moveX = 0; moveY = 0; }
+            float sy = Curve(RY);
+            if (sy != 0) { wheel += sy * 55; int w = (int)wheel; if (w != 0) { wheel -= w; Did += "wheel(" + w + ") "; Mouse(0x0800, w); } } else wheel = 0;
+            if ((went & ACCEPT) != 0) { leftHeld = true; Did += "leftdown "; Mouse(0x0002, 0); }
+            if ((gone & ACCEPT) != 0 && leftHeld) { leftHeld = false; Did += "leftup "; Mouse(0x0004, 0); }
+            if ((went & SECOND) != 0) { rightHeld = true; Did += "rightdown "; Mouse(0x0008, 0); }
+            if ((gone & SECOND) != 0 && rightHeld) { rightHeld = false; Did += "rightup "; Mouse(0x0010, 0); }
+            if ((went & ENTER) != 0) { Did += "enter "; Key(0x0D); }
+            if ((went & KEYS) != 0) Say("Keyboard");
+            if ((went & BACK) != 0) Say("Back");
+            // the d-pad is the arrow keys; the stick's own up/down/left/right doesn't count while it steers the pointer
+            bool steering = Math.Abs(LX) > 0.3f || Math.Abs(LY) > 0.3f;
+            string arrow = steering ? "" : DirName(now & DIRS), arrowBefore = DirName(was & DIRS);
+            bool press = false;
+            if (arrow == "") repeatAt = DateTime.MaxValue;
+            else if (arrow != arrowBefore || repeatAt == DateTime.MaxValue) { press = true; repeatAt = at.AddMilliseconds(380); }
+            else if (at >= repeatAt) { press = true; repeatAt = at.AddMilliseconds(90); }
+            if (press) { Did += "key(" + arrow + ") "; Key((byte)(arrow == "Up" ? 0x26 : arrow == "Down" ? 0x28 : arrow == "Left" ? 0x25 : 0x27)); }
+        } else {
+            // leaving Discord with a button still held: let go of it
+            if (leftHeld) { leftHeld = false; Mouse(0x0004, 0); }
+            if (rightHeld) { rightHeld = false; Mouse(0x0010, 0); }
+        }
+        if (Pointer && !Keys) { }
+        else if (Nav || Keys) {
+            if (Keys) {
+                if ((went & SECOND) != 0) Say("Second");
+                if ((went & KEYS) != 0) Say("Keyboard");
+                if ((went & ENTER) != 0) Say("Enter");
+            }
             if ((went & ACCEPT) != 0) Say("Accept");
             if ((went & BACK) != 0) Say("Back");
             string dir = DirName(now & DIRS), before = DirName(was & DIRS);
@@ -2131,6 +2258,8 @@ public class RPPad : NativeWindow, IDisposable {
                                 Marshal.Copy(new IntPtr(buf.ToInt64() + header + 8), rep, 0, each);
                                 int v = Parse(kind, rep);
                                 if (v >= 0) psState[dev] = v;
+                                float[] st = Sticks(kind, rep);
+                                if (st != null) psSticks[dev] = st;
                             }
                         }
                     } finally { Marshal.FreeHGlobal(buf); }
@@ -2927,7 +3056,16 @@ function Set-OvWeb {
         $ovWeb.Bounds = New-Object System.Drawing.Rectangle($p.X, $p.Y, $ovRoot.Width, ($ovRoot.Height - 56))
         if (-not $ovWeb.Visible) { $ovWeb.Show() }
     } elseif ($ovWeb.Visible) { $ovWeb.Hide() }
+    if (-not $show) { Hide-OvKeyboard }
     $ovDiscordBtn.Text = $(if ($show) { 'Back' } else { 'Discord' })
+    # inside Discord the controller is a mouse: the pointer starts in the middle of it
+    if ($script:OvOk) {
+        if ($show -and -not $script:Pad.Pointer -and $Settings.overlay_controller) {
+            [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(($ovWeb.Left + [int]($ovWeb.Width / 2)), ($ovWeb.Top + [int]($ovWeb.Height / 2)))
+        }
+        $script:Pad.Pointer = [bool]$show
+    }
+    Set-OvHint
 }
 function Open-OvDiscord {
     if (-not (Start-Chat)) { return }
@@ -3108,11 +3246,140 @@ function Invoke-OvFocus {
     if ($c -is [System.Windows.Forms.ListBox]) { return }       # moving up and down already picks the friend
     [void]$OvOnClick.Invoke($c, @([System.EventArgs]::Empty))
 }
+# the line of help in the top bar: what the keys and the controller do right now
+function Set-OvHint {
+    $pad = [bool]$Settings.overlay_controller
+    $ovHint.Text = $(if ($script:Kb.Open -and $pad) {
+        'D-pad or stick: move   A / Cross: type   X / Square: delete   Y / Triangle: space   Start / Options: Enter   B / Circle: close keyboard'
+    } elseif ($script:Chat.Open -and $ovWeb.Visible -and $pad) {
+        'Stick: pointer   A / Cross: click   X / Square: right-click   Right stick: scroll   Y / Triangle: keyboard   Start / Options: Enter   B / Circle: back'
+    } else {
+        "$($Settings.overlay_hotkey) or Esc to close$(if ($pad) { '.  Controller: logo button opens, d-pad moves, A / Cross picks, B / Circle closes' })"
+    })
+}
+# ---- controller keyboard: Y / Triangle inside Discord. Click a text box with the pointer first, then
+# type here with the d-pad or stick. It never takes the keyboard itself, so what you type goes to Discord.
+$KbPages = @{
+    abc = @('1234567890', 'qwertyuiop', "asdfghjkl'", 'zxcvbnm,.?')
+    sym = @('1234567890', '-/:;()$&@"', ".,?!'#%*+=", '_\|~<>[]{}')
+}
+$KbBottom = @(@('Shift', 96), @('Symbols', 96), @('Space', 250), @('Delete', 96), @('Enter', 96), @('Close', 76))
+$script:Kb = @{ Open = $false; Row = 1; Col = 0; Shift = $false; Page = 'abc'; Rows = @() }
+$ovKb = $(if ($script:OvOk) { New-Object RPNoFocusForm } else { New-Object System.Windows.Forms.Form })
+# TopMost is deliberately not set here: WinForms activates a window that has it, which would pull the keyboard
+# focus out of Discord's text box. RPNoFocusForm is always-on-top through its own window style instead.
+$ovKb.FormBorderStyle = 'None'; $ovKb.ShowInTaskbar = $false; $ovKb.StartPosition = 'Manual'
+$ovKb.Owner = $ovWeb      # stays above Discord's window, whichever was clicked last
+$ovKb.BackColor = $cSide; $ovKb.ForeColor = $cText; $ovKb.Font = $fOvBig; $ovKb.Size = Sz 760 268
+function New-KbKey($x, $y, $w, $row, $col) {
+    $k = New-Ctl System.Windows.Forms.Label $ovKb @{ Location = (Pt $x $y); Size = (Sz $w 44); TextAlign = 'MiddleCenter'; UseMnemonic = $false; BackColor = $cCardHi; Cursor = 'Hand'; Tag = @($row, $col) }
+    $k.add_Click({ $script:Kb.Row = [int]$this.Tag[0]; $script:Kb.Col = [int]$this.Tag[1]; Invoke-KbKey })
+    $k
+}
+for ($r = 0; $r -lt 4; $r++) {
+    $row = @(); for ($c = 0; $c -lt 10; $c++) { $row += (New-KbKey (10 + $c * 74) (10 + $r * 50) 68 $r $c) }
+    $script:Kb.Rows += , $row
+}
+$row = @(); $x = 10
+for ($c = 0; $c -lt $KbBottom.Count; $c++) { $k = New-KbKey $x 210 $KbBottom[$c][1] 4 $c; $k.Font = $fBold; $row += $k; $x += $KbBottom[$c][1] + 6 }
+$script:Kb.Rows += , $row
+function Get-KbChar($r, $c) {
+    $ch = "$($KbPages[$script:Kb.Page][$r][$c])"
+    if ($script:Kb.Shift -and $script:Kb.Page -eq 'abc') { $ch.ToUpperInvariant() } else { $ch }
+}
+function Update-OvKb {
+    $kb = $script:Kb
+    for ($r = 0; $r -lt 4; $r++) { for ($c = 0; $c -lt 10; $c++) { $kb.Rows[$r][$c].Text = Get-KbChar $r $c } }
+    for ($c = 0; $c -lt $KbBottom.Count; $c++) {
+        $name = $KbBottom[$c][0]
+        $kb.Rows[4][$c].Text = $(if ($name -eq 'Symbols') { if ($kb.Page -eq 'abc') { '#+=' } else { 'abc' } } elseif ($name -eq 'Shift' -and $kb.Shift) { 'SHIFT' } else { $name })
+    }
+    for ($r = 0; $r -lt 5; $r++) { for ($c = 0; $c -lt $kb.Rows[$r].Count; $c++) { $kb.Rows[$r][$c].BackColor = $(if ($r -eq $kb.Row -and $c -eq $kb.Col) { $cAccent } else { $cCardHi }) } }
+}
+function Move-OvKb($dir) {
+    $kb = $script:Kb
+    $r = $kb.Row; $c = $kb.Col
+    switch ($dir) {
+        'Left'  { $c = ($c - 1 + $kb.Rows[$r].Count) % $kb.Rows[$r].Count }
+        'Right' { $c = ($c + 1) % $kb.Rows[$r].Count }
+        'Up'    { $n = ($r + 4) % 5 }
+        'Down'  { $n = ($r + 1) % 5 }
+    }
+    if ($dir -in 'Up', 'Down') {
+        # the bottom row has six wide keys over ten narrow ones: land on the key above or below
+        if ($n -eq 4 -and $r -ne 4) { $x = $kb.Rows[$r][$c].Left + 34; $c = 0; for ($i = 0; $i -lt $kb.Rows[4].Count; $i++) { if ($x -ge $kb.Rows[4][$i].Left) { $c = $i } } }
+        elseif ($r -eq 4 -and $n -ne 4) { $x = $kb.Rows[4][$c].Left + $kb.Rows[4][$c].Width / 2; $c = [math]::Max(0, [math]::Min(9, [int][math]::Floor(($x - 10) / 74))) }
+        $r = $n
+    }
+    $kb.Row = $r; $kb.Col = $c
+    Update-OvKb
+}
+# what the highlighted key does; returns a word for what it did (used by the checks)
+# typing goes to whichever window has the keyboard: make sure that is Discord's
+function Set-KbTarget {
+    if ($script:Kb.Dry) { return }
+    try { if (-not [RPKeys]::IsFront($ovWeb.Handle)) { $ovWeb.Activate(); if ($script:Chat.View) { [void]$script:Chat.View.Focus() }; [System.Windows.Forms.Application]::DoEvents() } } catch {}
+}
+function Invoke-KbKey {
+    $kb = $script:Kb
+    Set-KbTarget
+    if ($kb.Row -lt 4) {
+        $ch = Get-KbChar $kb.Row $kb.Col
+        if (-not $kb.Dry) { [RPKeys]::Type($ch) }
+        if ($kb.Shift) { $kb.Shift = $false }       # Shift is for one letter
+        Update-OvKb
+        return "type:$ch"
+    }
+    $did = "$($KbBottom[$kb.Col][0])"
+    switch ($did) {
+        'Shift'   { $kb.Shift = -not $kb.Shift }
+        'Symbols' { $kb.Page = $(if ($kb.Page -eq 'abc') { 'sym' } else { 'abc' }) }
+        'Space'   { if (-not $kb.Dry) { [RPKeys]::Type(' ') } }
+        'Delete'  { if (-not $kb.Dry) { [RPKeys]::Press(0x08) } }
+        'Enter'   { if (-not $kb.Dry) { [RPKeys]::Press(0x0D) } }
+        'Close'   { Hide-OvKeyboard; return $did }
+    }
+    Update-OvKb
+    $did
+}
+function Show-OvKeyboard {
+    if (-not $script:OvOk -or -not $ovWeb.Visible) { return }
+    $ovKb.Location = Pt ($ovWeb.Left + [int](($ovWeb.Width - $ovKb.Width) / 2)) ($ovWeb.Bottom - $ovKb.Height - 8)
+    $script:Kb.Open = $true; $script:Pad.Keys = $true
+    Update-OvKb
+    [RPKeys]::ShowQuiet($ovKb.Handle)
+    Set-OvHint
+}
+function Hide-OvKeyboard {
+    if (-not $script:Kb.Open -and -not $ovKb.Visible) { return }
+    $script:Kb.Open = $false
+    if ($script:OvOk) { $script:Pad.Keys = $false }
+    $ovKb.Hide()
+    Set-OvHint
+}
+function Invoke-KbPad($what) {
+    if ($what -in 'Second', 'Keyboard', 'Enter') { Set-KbTarget }
+    switch ($what) {
+        'Accept'   { [void](Invoke-KbKey) }
+        'Second'   { if (-not $script:Kb.Dry) { [RPKeys]::Press(0x08) } }       # X / Square: delete
+        'Keyboard' { if (-not $script:Kb.Dry) { [RPKeys]::Type(' ') } }         # Y / Triangle: space
+        'Enter'    { if (-not $script:Kb.Dry) { [RPKeys]::Press(0x0D) } }       # Start / Options: Enter
+        'Back'     { Hide-OvKeyboard }
+        default    { Move-OvKb $what }
+    }
+}
 function Invoke-OvPad($what) {
     if (-not $ov.Visible) { return }
+    if ($script:Kb.Open) { Invoke-KbPad $what; return }
+    if ($script:Chat.Open -and $ovWeb.Visible) {
+        # inside Discord only these two arrive; everything else is the pointer
+        if ($what -eq 'Back') { Close-OvDiscord } elseif ($what -eq 'Keyboard') { Show-OvKeyboard }
+        return
+    }
     switch ($what) {
         'Accept' { Invoke-OvFocus }
         'Back'   { Hide-Overlay }
+        'Keyboard' { }
         default  { Move-OvFocus $what }
     }
 }
@@ -3168,7 +3435,7 @@ function Show-Overlay {
     $script:OvWide = ($b.Width -ge 1600)
     Set-OvColumns
     $ovRoot.Location = Pt ([math]::Max(0, [int](($b.Width - $ovRoot.Width) / 2))) ([math]::Max(0, [int](($b.Height - $ovRoot.Height) / 2)))
-    $ovHint.Text = "$($Settings.overlay_hotkey) or Esc to close$(if ($Settings.overlay_controller) { '.  Controller: logo button opens, d-pad moves, A / Cross picks, B / Circle closes' })"
+    Set-OvHint
     Set-OvFocus $null
     $ovSearch.Text = ''
     # the custom statuses, as the Custom status page has them
@@ -3189,7 +3456,8 @@ function Show-Overlay {
 function Hide-Overlay {
     if (-not $ov.Visible) { return }
     $ovTimer.Stop()
-    if ($script:OvOk) { $script:Pad.Nav = $false }
+    Hide-OvKeyboard
+    if ($script:OvOk) { $script:Pad.Nav = $false; $script:Pad.Pointer = $false }
     $ovWeb.Hide()
     $ov.Hide(); $ovDim.Hide()
 }

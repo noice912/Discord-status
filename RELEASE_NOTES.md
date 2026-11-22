@@ -1,3 +1,32 @@
+## RichPresence 3.3.1
+
+### Use Discord in the overlay with your controller (Windows)
+Discord is a web page, so inside it the controller works as a mouse.
+
+| Control | What it does |
+|---|---|
+| **Left stick** | Moves the pointer: gentle near the middle, fast at the edge |
+| **A** / **Cross** | Click (hold to drag) |
+| **X** / **Square** | Right-click |
+| **Right stick** | Scroll |
+| **D-pad** | Arrow keys |
+| **Start** / **Options** | Enter |
+| **Y** / **Triangle** | Opens the controller keyboard |
+| **B** / **Circle** | Back to the overlay's widgets |
+
+### Controller keyboard
+Click a text box with the pointer, then press **Y / Triangle**. A keyboard appears at the bottom of Discord.
+Move with the d-pad or left stick and press **A / Cross** to type. **X / Square** deletes, **Y / Triangle**
+is a space, **Start / Options** is Enter and **B / Circle** closes it. **Shift** capitalises the next letter,
+and **#+=** switches to symbols and back.
+
+Good to know:
+- The game underneath still gets the same stick and button presses.
+- Tried with a DualSense. An Xbox controller should behave the same but **hasn't been tried**; if a button
+  does the wrong thing, please open an issue and say which controller.
+
+Linux, Android and iPhone: no changes, only the version number.
+
 ## RichPresence 3.3.0
 
 ### Discord inside the overlay (Windows)
