@@ -33,7 +33,7 @@ $DefaultAppId   = '1544831111128154213'   # "Playing" - current-app card
 # built-in apps that custom statuses can borrow when the user hasn't made their own Discord app (one card each)
 $CustomPoolIds  = @('1553178514365358100', '1553247468957990943')
 $RepoUrl      = 'https://github.com/noice912/Discord-status'
-$AppVersion   = '3.2.1'     # build.ps1 reads this; bump it for every release
+$AppVersion   = '3.2.2'     # build.ps1 reads this; bump it for every release
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
 # ===========================================================================
@@ -1976,8 +1976,9 @@ public static class RPKeys {
     public static void Tap(byte vk) { keybd_event(vk, 0, 1, UIntPtr.Zero); keybd_event(vk, 0, 3, UIntPtr.Zero); }
 }
 
-// The logo button on a controller: the Xbox button (read through XInput) and the PS button on a
-// DualSense or DualShock 4 (read from the controller's own reports). Works while a game has the keyboard.
+// The controller: its logo button opens the overlay, and while the overlay is open the d-pad or left
+// stick moves around it, A / Cross picks and B / Circle closes. Xbox controllers are read through XInput,
+// a DualSense or DualShock 4 from the controller's own reports. Works while a game has the keyboard.
 public class RPPad : NativeWindow, IDisposable {
     [StructLayout(LayoutKind.Sequential)] struct XState { public uint Packet; public ushort Buttons; public byte LT, RT; public short LX, LY, RX, RY; }
     [DllImport("xinput1_4.dll", EntryPoint = "#100")] static extern int XInputGetStateEx(int index, out XState state);
@@ -1986,19 +1987,26 @@ public class RPPad : NativeWindow, IDisposable {
     [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr input, uint cmd, IntPtr data, ref uint size, uint headerSize);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint GetRawInputDeviceInfo(IntPtr dev, uint cmd, StringBuilder data, ref uint size);
 
-    public event EventHandler Pressed;
+    // what a controller is doing right now, packed into one number
+    public const int LOGO = 1, ACCEPT = 2, BACK = 4, UP = 16, DOWN = 32, LEFT = 64, RIGHT = 128, DIRS = 240;
+
+    public event EventHandler Pressed;                      // the logo button went down
+    public event EventHandler Moved;                        // a move, pick or back while Nav is on; which one is in Last
+    public string Last = "";                                // "Up", "Down", "Left", "Right", "Accept", "Back"
+    public bool Nav;                                        // the overlay is open: report moves
     public int Presses;                                     // how many times a logo button went down
     public string Seen = "";                                // the PlayStation controllers that have sent anything
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
-    readonly bool[] xDown = new bool[4];
     readonly int[] xSkip = new int[4];
     bool xinput = true, on;
+    int was;                                                // the state at the last look
+    DateTime repeatAt = DateTime.MaxValue, firedAt = DateTime.MinValue;
     readonly Dictionary<IntPtr, int> kinds = new Dictionary<IntPtr, int>();     // 0 = not ours, 1 = DualSense, 2 = DualShock 4
-    readonly Dictionary<IntPtr, bool> psDown = new Dictionary<IntPtr, bool>();
+    readonly Dictionary<IntPtr, int> psState = new Dictionary<IntPtr, int>();
 
     public RPPad() {
         CreateHandle(new CreateParams());
-        timer.Interval = 50;
+        timer.Interval = 40;
         timer.Tick += delegate { Poll(); };
     }
     public void Enable(bool want) {
@@ -2008,21 +2016,83 @@ public class RPPad : NativeWindow, IDisposable {
         RawDevice[] d = new RawDevice[2];
         for (int i = 0; i < 2; i++) { d[i].UsagePage = 1; d[i].Usage = (ushort)(i == 0 ? 5 : 4); d[i].Flags = want ? 0x100u : 1u; d[i].Target = want ? Handle : IntPtr.Zero; }
         RegisterRawInputDevices(d, 2, (uint)Marshal.SizeOf(typeof(RawDevice)));
+        psState.Clear(); was = 0;
         if (want) timer.Start(); else timer.Stop();
     }
-    void Fire() { Presses++; if (Pressed != null) Pressed(this, EventArgs.Empty); }
 
+    static int XButtons(XState s) {
+        int v = 0;
+        if ((s.Buttons & 0x0400) != 0) v |= LOGO;
+        if ((s.Buttons & 0x1000) != 0) v |= ACCEPT;
+        if ((s.Buttons & 0x2000) != 0) v |= BACK;
+        if ((s.Buttons & 1) != 0 || s.LY > 20000) v |= UP;
+        if ((s.Buttons & 2) != 0 || s.LY < -20000) v |= DOWN;
+        if ((s.Buttons & 4) != 0 || s.LX < -20000) v |= LEFT;
+        if ((s.Buttons & 8) != 0 || s.LX > 20000) v |= RIGHT;
+        return v;
+    }
+    // A PlayStation controller's report -> the same packed state; -1 = not a report that carries the buttons.
+    // kind 1 = DualSense, 2 = DualShock 4. The report id is the first byte.
+    public static int Parse(int kind, byte[] r) {
+        if (r == null || r.Length < 8) return -1;
+        int ps, stick = 1;
+        if (kind == 1) {
+            if (r[0] == 0x31) { ps = 11; stick = 2; }       // Bluetooth, full report
+            else if (r[0] == 0x01) ps = r.Length >= 64 ? 10 : 7;    // USB : Bluetooth, short report
+            else return -1;
+        } else if (kind == 2) {
+            if (r[0] == 0x11) { ps = 9; stick = 3; }        // Bluetooth
+            else if (r[0] == 0x01) ps = 7;                  // USB
+            else return -1;
+        } else return -1;
+        if (ps >= r.Length) return -1;
+        int v = 0, b = r[ps - 2], hat = b & 15;
+        if ((r[ps] & 1) != 0) v |= LOGO;
+        if ((b & 0x20) != 0) v |= ACCEPT;                   // Cross
+        if ((b & 0x40) != 0) v |= BACK;                     // Circle
+        if (hat == 7 || hat == 0 || hat == 1 || r[stick + 1] < 50) v |= UP;
+        if (hat == 3 || hat == 4 || hat == 5 || r[stick + 1] > 205) v |= DOWN;
+        if (hat == 5 || hat == 6 || hat == 7 || r[stick] < 50) v |= LEFT;
+        if (hat == 1 || hat == 2 || hat == 3 || r[stick] > 205) v |= RIGHT;
+        return v;
+    }
+
+    void Say(string what) { Last = what; if (Moved != null) Moved(this, EventArgs.Empty); }
+    static string DirName(int d) {
+        // one direction at a time: up and down win over left and right on a diagonal
+        return (d & UP) != 0 ? "Up" : (d & DOWN) != 0 ? "Down" : (d & LEFT) != 0 ? "Left" : (d & RIGHT) != 0 ? "Right" : "";
+    }
     void Poll() {
-        if (!xinput) return;
-        for (int i = 0; i < 4; i++) {
-            if (xSkip[i] > 0) { xSkip[i]--; continue; }     // an empty slot is slow to ask: look again in 2 seconds
-            XState s; int r;
-            try { r = XInputGetStateEx(i, out s); } catch { xinput = false; return; }
-            if (r != 0) { xSkip[i] = 40; xDown[i] = false; continue; }
-            bool down = (s.Buttons & 0x0400) != 0;
-            if (down && !xDown[i]) Fire();
-            xDown[i] = down;
+        int now = 0;
+        if (xinput) {
+            for (int i = 0; i < 4; i++) {
+                if (xSkip[i] > 0) { xSkip[i]--; continue; }     // an empty slot is slow to ask: look again in 2 seconds
+                XState s; int r;
+                try { r = XInputGetStateEx(i, out s); } catch { xinput = false; break; }
+                if (r != 0) { xSkip[i] = 50; continue; }
+                now |= XButtons(s);
+            }
         }
+        foreach (int v in psState.Values) now |= v;
+        Step(now, DateTime.UtcNow);
+    }
+    // turns "what is held now" into presses; public so it can be driven without a controller
+    public void Step(int now, DateTime at) {
+        int went = now & ~was;
+        // a controller that some program also shows as an Xbox one reports the logo twice: once is enough
+        if ((went & LOGO) != 0 && (at - firedAt).TotalMilliseconds > 400) {
+            firedAt = at; Presses++;
+            if (Pressed != null) Pressed(this, EventArgs.Empty);
+        }
+        if (Nav) {
+            if ((went & ACCEPT) != 0) Say("Accept");
+            if ((went & BACK) != 0) Say("Back");
+            string dir = DirName(now & DIRS), before = DirName(was & DIRS);
+            if (dir == "") repeatAt = DateTime.MaxValue;
+            else if (dir != before) { Say(dir); repeatAt = at.AddMilliseconds(380); }
+            else if (at >= repeatAt) { Say(dir); repeatAt = at.AddMilliseconds(120); }      // held down
+        } else repeatAt = DateTime.MaxValue;
+        was = now;
     }
 
     int Kind(IntPtr dev) {
@@ -2044,17 +2114,6 @@ public class RPPad : NativeWindow, IDisposable {
         kinds[dev] = k;
         return k;
     }
-    // where the PS button is in a report; -1 = this report doesn't carry it
-    public static int PsByte(int kind, int reportId, int size) {
-        if (kind == 1) {
-            if (reportId == 0x31) return 11;                // Bluetooth, full report
-            if (reportId == 0x01) return size >= 64 ? 10 : 7;   // USB : Bluetooth, short report
-        } else if (kind == 2) {
-            if (reportId == 0x11) return 9;                 // Bluetooth
-            if (reportId == 0x01) return 7;                 // USB
-        }
-        return -1;
-    }
     protected override void WndProc(ref Message m) {
         if (m.Msg == 0x00FF && on) {
             try {
@@ -2068,14 +2127,10 @@ public class RPPad : NativeWindow, IDisposable {
                             int kind = Kind(dev);
                             int each = Marshal.ReadInt32(buf, (int)header), count = Marshal.ReadInt32(buf, (int)header + 4);
                             if (kind != 0 && each > 0 && count > 0 && header + 8 + each <= size) {
-                                int at = (int)header + 8;
-                                int idx = PsByte(kind, Marshal.ReadByte(buf, at), each);
-                                if (idx >= 0 && idx < each) {
-                                    bool down = (Marshal.ReadByte(buf, at + idx) & 1) != 0, was;
-                                    psDown.TryGetValue(dev, out was);
-                                    if (down && !was) Fire();
-                                    psDown[dev] = down;
-                                }
+                                byte[] rep = new byte[each];
+                                Marshal.Copy(new IntPtr(buf.ToInt64() + header + 8), rep, 0, each);
+                                int v = Parse(kind, rep);
+                                if (v >= 0) psState[dev] = v;
                             }
                         }
                     } finally { Marshal.FreeHGlobal(buf); }
@@ -2576,7 +2631,7 @@ function New-OvButton($parent, $text, $x, $y, $w, $h) {
 # ---- top bar
 $ovTop = New-Ctl System.Windows.Forms.Panel $ovRoot @{ Location = (Pt 0 0); Size = (Sz 1172 44); BackColor = $cSide }
 [void](New-Ctl System.Windows.Forms.Label $ovTop @{ Text = 'RichPresence'; Font = $fOvBig; Location = (Pt 12 9); AutoSize = $true })
-$ovHint  = New-Ctl System.Windows.Forms.Label $ovTop @{ Text = ''; ForeColor = $cDim; Location = (Pt 150 14); Size = (Sz 600 20) }
+$ovHint  = New-Ctl System.Windows.Forms.Label $ovTop @{ Text = ''; ForeColor = $cDim; Location = (Pt 150 14); Size = (Sz 800 20) }
 $ovClock = New-Ctl System.Windows.Forms.Label $ovTop @{ Text = ''; Font = $fOvBig; TextAlign = 'MiddleRight'; Location = (Pt 960 8); Size = (Sz 150 28) }
 $ovClose = New-OvButton $ovTop ([string][char]0xE711) 1122 6 40 32
 $ovClose.Font = $fOvIcon
@@ -2641,13 +2696,18 @@ foreach ($row in $storeRows) {
 
 # ---- volume
 $ovAudio = New-OvWidget 'Volume' 396 56 380 330
+# applies a slider's value (the mouse and the controller both end up here)
+function Set-OvBar($bar) {
+    try {
+        if ($bar -eq $ovRgbBright) { $Settings.rgb_brightness = $bar.Value; if ($script:OvOk) { $script:Rgb.Brightness = $bar.Value }; return }
+        if ([int]$bar.Tag -lt 0) { [RPAudio]::SetMaster($bar.Value / 100) } else { [RPAudio]::SetSession([int]$bar.Tag, $bar.Value / 100) }
+    } catch {}
+}
 function New-OvVolRow($parent, $name, $y, $procId) {
     $lbl = New-Ctl System.Windows.Forms.Label $parent @{ Text = $name; UseMnemonic = $false; Location = (Pt 0 ($y + 6)); Size = (Sz 116 20); AutoEllipsis = $true }
     $bar = New-Ctl System.Windows.Forms.TrackBar $parent @{ AutoSize = $false; Location = (Pt 116 $y); Size = (Sz 176 30); Maximum = 100; TickStyle = 'None'; BackColor = $cCard; Tag = $procId }
     $mute = New-Ctl System.Windows.Forms.CheckBox $parent @{ Text = 'Mute'; Location = (Pt 296 ($y + 4)); AutoSize = $true; ForeColor = $cDim; Tag = $procId }
-    $bar.add_Scroll({
-        try { if ([int]$this.Tag -lt 0) { [RPAudio]::SetMaster($this.Value / 100) } else { [RPAudio]::SetSession([int]$this.Tag, $this.Value / 100) } } catch {}
-    })
+    $bar.add_Scroll({ Set-OvBar $this })
     $mute.add_Click({
         try { if ([int]$this.Tag -lt 0) { [RPAudio]::SetMasterMute($this.Checked) } else { [RPAudio]::SetSessionMute([int]$this.Tag, $this.Checked) } } catch {}
     })
@@ -2717,7 +2777,7 @@ function Set-RgbSync($on) {
     if ($on) { $script:Rgb.Start('127.0.0.1', 6742) } else { $script:Rgb.Stop() }
 }
 $ovRgbOn.add_Click({ $Settings.rgb_sync = $ovRgbOn.Checked; Save-Settings $Settings; Set-RgbSync $ovRgbOn.Checked })
-$ovRgbBright.add_Scroll({ $Settings.rgb_brightness = $ovRgbBright.Value; if ($script:OvOk) { $script:Rgb.Brightness = $ovRgbBright.Value } })
+$ovRgbBright.add_Scroll({ Set-OvBar $ovRgbBright })
 $ovRgbBright.add_MouseUp({ Save-Settings $Settings })
 
 # ---- games
@@ -2753,6 +2813,108 @@ function Update-OvGames {
     }
 }
 $ovSearch.add_TextChanged({ Update-OvGames })
+
+# ---- moving around with the controller: a frame shows where you are
+$script:OvFocus = $null
+$ovRing = @(1..4 | ForEach-Object { New-Ctl System.Windows.Forms.Panel $ovRoot @{ Size = (Sz 2 2); BackColor = $cAccent; Visible = $false } })
+$OvOnClick = [System.Windows.Forms.Control].GetMethod('OnClick', [System.Reflection.BindingFlags]'NonPublic,Instance')
+function Test-OvRow($c) { ($c -is [System.Windows.Forms.Panel]) -and ($c.Parent -eq $ovGameList) }
+function Get-OvRect($c) { $ovRoot.RectangleToClient($c.RectangleToScreen($c.ClientRectangle)) }
+# everything the controller can land on: buttons, tick boxes, sliders, the lists and the game rows
+function Get-OvTargets {
+    $out = New-Object System.Collections.ArrayList
+    $todo = New-Object System.Collections.Stack
+    $todo.Push($ovRoot)
+    while ($todo.Count) {
+        foreach ($k in $todo.Pop().Controls) {
+            if (-not $k.Visible) { continue }
+            if (Test-OvRow $k) { [void]$out.Add($k) }
+            elseif ($k -is [System.Windows.Forms.ButtonBase] -or $k -is [System.Windows.Forms.TrackBar] -or $k -is [System.Windows.Forms.ComboBox]) { if ($k.Enabled) { [void]$out.Add($k) } }
+            elseif ($k -is [System.Windows.Forms.CheckedListBox]) { if ($k.Items.Count) { [void]$out.Add($k) } }
+            elseif ($k.Controls.Count) { $todo.Push($k) }
+        }
+    }
+    , $out
+}
+function Update-OvRing {
+    $c = $script:OvFocus
+    if (-not $c -or $c.IsDisposed -or -not $c.Visible) { $script:OvFocus = $null; foreach ($p in $ovRing) { $p.Visible = $false }; return }
+    $r = Get-OvRect $c
+    $ovRing[0].Bounds = New-Object System.Drawing.Rectangle(($r.X - 4), ($r.Y - 4), ($r.Width + 8), 2)
+    $ovRing[1].Bounds = New-Object System.Drawing.Rectangle(($r.X - 4), ($r.Bottom + 2), ($r.Width + 8), 2)
+    $ovRing[2].Bounds = New-Object System.Drawing.Rectangle(($r.X - 4), ($r.Y - 4), 2, ($r.Height + 8))
+    $ovRing[3].Bounds = New-Object System.Drawing.Rectangle(($r.Right + 2), ($r.Y - 4), 2, ($r.Height + 8))
+    foreach ($p in $ovRing) { $p.Visible = $true; $p.BringToFront() }
+}
+function Set-OvFocus($c) {
+    $script:OvFocus = $c
+    if ($c) {
+        if (Test-OvRow $c) { $ovGameList.ScrollControlIntoView($c) }
+        if ($c -is [System.Windows.Forms.CheckedListBox] -and $c.SelectedIndex -lt 0) { $c.SelectedIndex = 0 }
+    }
+    Update-OvRing
+}
+function Move-OvFocus($dir) {
+    $cur = $script:OvFocus
+    if ($cur -and ($cur.IsDisposed -or -not $cur.Visible)) { $cur = $null }
+    if (-not $cur) { Set-OvFocus $ovPlay; return }
+    # a slider moves with left and right; a list moves inside itself before it lets go
+    if ($cur -is [System.Windows.Forms.TrackBar] -and $dir -in 'Left', 'Right') {
+        $v = [math]::Max($cur.Minimum, [math]::Min($cur.Maximum, $cur.Value + $(if ($dir -eq 'Right') { 5 } else { -5 })))
+        if ($v -ne $cur.Value) { $cur.Value = $v; Set-OvBar $cur; if ($cur -eq $ovRgbBright) { Save-Settings $Settings } }
+        return
+    }
+    if ($cur -is [System.Windows.Forms.CheckedListBox] -and $dir -in 'Up', 'Down') {
+        $i = $cur.SelectedIndex + $(if ($dir -eq 'Down') { 1 } else { -1 })
+        if ($i -ge 0 -and $i -lt $cur.Items.Count) { $cur.SelectedIndex = $i; return }
+    }
+    $r = Get-OvRect $cur
+    $cx = $r.X + $r.Width / 2; $cy = $r.Y + $r.Height / 2
+    $curIsRow = Test-OvRow $cur
+    $listRect = Get-OvRect $ovGameList
+    $best = $null; $bestScore = [double]::MaxValue
+    foreach ($t in (Get-OvTargets)) {
+        if ($t -eq $cur) { continue }
+        $tr = Get-OvRect $t
+        $tx = $tr.X + $tr.Width / 2; $ty = $tr.Y + $tr.Height / 2
+        # games scrolled out of sight are only reached from the game above or below them
+        if ((Test-OvRow $t) -and -not $curIsRow -and ($ty -lt $listRect.Y -or $ty -gt $listRect.Bottom)) { continue }
+        switch ($dir) {
+            'Up'    { $main = $cy - $ty; $side = [math]::Abs($tx - $cx) }
+            'Down'  { $main = $ty - $cy; $side = [math]::Abs($tx - $cx) }
+            'Left'  { $main = $cx - $tx; $side = [math]::Abs($ty - $cy) }
+            default { $main = $tx - $cx; $side = [math]::Abs($ty - $cy) }
+        }
+        if ($main -le 12) { continue }
+        $score = $main + 3 * $side
+        if ($score -lt $bestScore) { $bestScore = $score; $best = $t }
+    }
+    if ($best) { Set-OvFocus $best }
+}
+function Invoke-OvFocus {
+    $c = $script:OvFocus
+    if (-not $c -or $c.IsDisposed -or -not $c.Visible) { Set-OvFocus $ovPlay; return }
+    if ($c -is [System.Windows.Forms.TrackBar]) { return }
+    if ($c -is [System.Windows.Forms.ComboBox]) {
+        # the OBS scene: each press goes to the next one
+        if ($c.Items.Count) { $c.SelectedIndex = ($c.SelectedIndex + 1) % $c.Items.Count; if ($script:OvOk) { $script:Obs.SetScene("$($c.SelectedItem)") } }
+        return
+    }
+    if ($c -is [System.Windows.Forms.CheckedListBox]) {
+        $i = $c.SelectedIndex
+        if ($i -ge 0) { $c.SetItemChecked($i, -not $c.GetItemChecked($i)) }
+        return
+    }
+    [void]$OvOnClick.Invoke($c, @([System.EventArgs]::Empty))
+}
+function Invoke-OvPad($what) {
+    if (-not $ov.Visible) { return }
+    switch ($what) {
+        'Accept' { Invoke-OvFocus }
+        'Back'   { Hide-Overlay }
+        default  { Move-OvFocus $what }
+    }
+}
 
 # ---- show, hide, refresh
 $script:OvTick = 0; $script:OvLoading = $false
@@ -2793,6 +2955,7 @@ function Update-Overlay {
         $ovRgbSwatch.BackColor = $(if ($script:Rgb.Running) { [System.Drawing.Color]::FromArgb(255, ($col -shr 16) -band 255, ($col -shr 8) -band 255, $col -band 255) } else { $cCardHi })
     }
     if ($script:OvTick % 4 -eq 0) { Update-OvAudio; Update-OvGames }
+    if ($script:OvFocus) { Update-OvRing }
     $script:OvTick++
 }
 $ovTimer.add_Tick({ try { Update-Overlay } catch {} })
@@ -2801,7 +2964,8 @@ function Show-Overlay {
     $b = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).Bounds
     $ovDim.Bounds = $b; $ov.Bounds = $b
     $ovRoot.Location = Pt ([math]::Max(0, [int](($b.Width - $ovRoot.Width) / 2))) ([math]::Max(0, [int](($b.Height - $ovRoot.Height) / 2)))
-    $ovHint.Text = "$($Settings.overlay_hotkey)$(if ($Settings.overlay_controller) { ', the controller''s logo button' }) or Esc to close"
+    $ovHint.Text = "$($Settings.overlay_hotkey) or Esc to close$(if ($Settings.overlay_controller) { '.  Controller: logo button opens, d-pad moves, A / Cross picks, B / Circle closes' })"
+    Set-OvFocus $null
     $ovSearch.Text = ''
     # the custom statuses, as the Custom status page has them
     $script:OvLoading = $true
@@ -2815,10 +2979,12 @@ function Show-Overlay {
     try { Update-Overlay } catch {}
     $ovDim.Show(); $ov.Show(); $ov.Activate()
     $ovTimer.Start()
+    if ($script:OvOk) { $script:Pad.Nav = $true }
 }
 function Hide-Overlay {
     if (-not $ov.Visible) { return }
     $ovTimer.Stop()
+    if ($script:OvOk) { $script:Pad.Nav = $false }
     $ov.Hide(); $ovDim.Hide()
 }
 function Switch-Overlay { if ($ov.Visible) { Hide-Overlay } else { Show-Overlay } }
@@ -2832,6 +2998,7 @@ foreach ($f in $ov, $ovDim) { $f.add_FormClosing({ param($s, $e) if (-not $scrip
 if ($script:OvOk) {
     $script:Hotkey.add_Pressed({ try { Switch-Overlay } catch {} })
     $script:Pad.add_Pressed({ try { Switch-Overlay } catch {} })
+    $script:Pad.add_Moved({ try { Invoke-OvPad "$($script:Pad.Last)" } catch {} })
     Set-OverlayHotkey
     Set-OverlayController
     if ($Settings.rgb_sync) { Set-RgbSync $true }

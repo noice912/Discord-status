@@ -1,3 +1,23 @@
+## RichPresence 3.2.2
+
+### Use the overlay with your controller (Windows)
+Once the overlay is open, the controller drives it. A blue frame shows where you are.
+
+- **D-pad or left stick**: move. Hold to keep moving.
+- **A** (Xbox) / **Cross** (PlayStation): press the button, tick the box or start the highlighted game.
+  On the OBS scene list each press goes to the next scene.
+- **Left and right on a slider**: change the volume or the brightness.
+- **B** / **Circle**, or the logo button again: close.
+
+Good to know:
+- The game still gets the same presses. Nothing is put inside the game, so RichPresence can't hide the
+  controller from it; a game that listens while it's in the background will react too.
+- This was checked with simulated presses and a connected DualSense, **not yet with real presses on every
+  controller**. If a button does the wrong thing, please open an issue and say which controller and
+  whether it's on USB or Bluetooth.
+
+Linux, Android and iPhone: no changes, only the version number.
+
 ## RichPresence 3.2.1
 
 ### Open the overlay from your controller (Windows)

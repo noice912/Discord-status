@@ -74,7 +74,7 @@ Your settings are stored in `%APPDATA%\RichPresence`. Delete that folder to rese
 
 ## In-game overlay (Windows)
 
-Press **Ctrl+Alt+G**, or the **Xbox / PS button** on your controller, while you play and a panel opens over the game. Press it again, press Esc or click outside to close it.
+Press **Ctrl+Alt+G**, or the **Xbox / PS button** on your controller, while you play and a panel opens over the game. Press it again, press Esc or click outside to close it. With a controller: the d-pad or left stick moves, **A / Cross** picks, left and right change a slider, and **B / Circle** closes.
 
 | Part | What it does |
 |---|---|
