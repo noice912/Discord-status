@@ -1,3 +1,28 @@
+## RichPresence 3.2.0
+
+### In-game overlay (Windows)
+Press **Ctrl+Alt+G** while you play and a panel opens over the game. Esc, the shortcut again or a click
+outside closes it.
+
+- **Music**: the song and its live lyric line, with previous, play/pause and next
+- **Volume**: a slider and mute for the whole PC and for each app making sound
+- **Games**: your library with search; click a game to start it
+- **Steam, Xbox & PlayStation**: Steam library, Big Picture and friends; the Xbox app and Cloud Gaming; PS Remote Play
+- **OBS**: start or stop recording, go live, save a replay, switch scene
+- **Lights**: your RGB lights follow the colour of the screen, through OpenRGB
+- **Discord**: presence on or off and your custom statuses
+
+Change or turn off the shortcut at the bottom of **Settings**.
+
+Good to know:
+- It shows over borderless and windowed games (most games today), not over true exclusive fullscreen.
+  Nothing is put inside the game, so anti-cheat has nothing to object to.
+- OBS needs **Tools > WebSocket Server Settings > Enable WebSocket server**.
+- Lights need [OpenRGB](https://openrgb.org) open with its **SDK server** running. Turning the sync off
+  leaves the lights on the last colour.
+- OBS control and the light sync were built against their documented interfaces but **not yet tried
+  end to end**. If one misbehaves, please open an issue.
+
 ## RichPresence 2.1.6
 
 ### Spotify with live lyrics (Windows)
