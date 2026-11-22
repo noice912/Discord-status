@@ -33,7 +33,7 @@ $DefaultAppId   = '1544831111128154213'   # "Playing" - current-app card
 # built-in apps that custom statuses can borrow when the user hasn't made their own Discord app (one card each)
 $CustomPoolIds  = @('1553178514365358100', '1553247468957990943')
 $RepoUrl      = 'https://github.com/noice912/Discord-status'
-$AppVersion   = '2.1.6'     # build.ps1 reads this; bump it for every release
+$AppVersion   = '3.2.0'     # build.ps1 reads this; bump it for every release
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
 # ===========================================================================
@@ -63,6 +63,10 @@ function New-DefaultSettings {
         close_to_tray          = $true
         custom_statuses        = @()        # your own cards: text, pictures, buttons (see the Custom status page)
         custom_mode            = 'separate' # 'separate' = one card each, 'merge' = the ticked ones become one card
+        overlay_enabled        = $true      # the panel over the game
+        overlay_hotkey         = 'Ctrl+Alt+G'
+        rgb_sync               = $false     # lights follow the screen (through OpenRGB)
+        rgb_brightness         = 100
     }
 }
 function Load-Settings {
@@ -1020,9 +1024,12 @@ public static class RPWin {
                 }
                 $musicActive = [bool]($status -eq 'Playing' -and $title)
             }
+            # the overlay shows this
+            $Sync.Now = if ($title) { @{ Title = $title; Artist = $artist; Player = $player; Playing = $musicActive; Line = '' } } else { $null }
             if ($musicActive -and (Connect-Discord $ConnMusic)) {
                 $lyrics  = Get-SyncedLyrics $artist $title $album $duration
                 $curLine = Get-CurrentLyricLine $lyrics $position
+                if ($ShowLyrics -and $curLine -and $Sync.Now) { $Sync.Now.Line = "$curLine" }
                 $id = "music|$player|$artist|$title|$album"
                 $trackChanged = ($ConnMusic.Id -ne $id)
                 $lyricChanged = ($ShowLyrics -and $curLine -and $curLine -ne $lastLyricLine)
@@ -1303,7 +1310,7 @@ function New-Sync {
     [hashtable]::Synchronized(@{
         Stop = $false; Queue = (New-Object System.Collections.Concurrent.ConcurrentQueue[string])
         Status = 'Stopped'; Games = @(); RunningIds = @(); WatchId = $null; GameExited = $false; ScanDone = $false; AppLabel = ''
-        UpdateState = ''; UpdateFile = $null; UpdateHash = ''; LatestVersion = ''; Custom = @{ Mode = 'separate'; Items = @() }
+        Now = $null; UpdateState = ''; UpdateFile = $null; UpdateHash = ''; LatestVersion = ''; Custom = @{ Mode = 'separate'; Items = @() }
         Ext = [hashtable]::Synchronized(@{}); BridgeStop = $false     # what the browser extension reports: service -> (tab -> report)
     })
 }
@@ -1576,6 +1583,9 @@ Style-Button $btnUpdate $false
 $updateLbl = New-Ctl System.Windows.Forms.Label $pSettings @{ Text = "Version $AppVersion"; ForeColor = $cDim; Location = (Pt 334 436); AutoSize = $true }
 Style-Button $btnSave $true
 $linkGuide = New-Ctl System.Windows.Forms.LinkLabel $pSettings @{ Text = 'Help & source on GitHub'; UseMnemonic = $false; Location = (Pt 24 476); AutoSize = $true; LinkColor = $cAccent }
+$chkOverlay = New-Check $pSettings 'Open the overlay over my game with this shortcut:' 512
+$txtHotkey = New-Ctl System.Windows.Forms.TextBox $pSettings @{ Location = (Pt 356 510); Size = (Sz 130 24); BackColor = $cCard; ForeColor = $cText; BorderStyle = 'FixedSingle' }
+$hotkeyHint = New-Ctl System.Windows.Forms.Label $pSettings @{ Text = 'Music, volume, games, OBS, lights and Discord. Shows over borderless and windowed games.'; ForeColor = $cDim; Font = $fSmall; Location = (Pt 42 536); AutoSize = $true }
 
 # ---- Log page
 $log = New-Ctl System.Windows.Forms.TextBox $pLog @{ Dock = 'Fill'; Multiline = $true; ReadOnly = $true; ScrollBars = 'Vertical'; BackColor = $cCard; ForeColor = $cText; BorderStyle = 'None'; Font = (New-Object System.Drawing.Font('Consolas', 9)) }
@@ -1594,6 +1604,7 @@ function Apply-ToUi {
     $chkTray.Checked = [bool]$Settings.close_to_tray; $chkWin.Checked = [bool]$Settings.start_with_windows
     $chkOfficial.Checked = [bool]$Settings.official_to_discord
     $chkUpdate.Checked = [bool]$Settings.auto_update
+    $chkOverlay.Checked = [bool]$Settings.overlay_enabled; $txtHotkey.Text = "$($Settings.overlay_hotkey)"
 }
 function Read-FromUi {
     $Settings.genshin_uid = $txtUid.Text.Trim()
@@ -1607,7 +1618,11 @@ function Read-FromUi {
     $Settings.close_to_tray = $chkTray.Checked; $Settings.start_with_windows = $chkWin.Checked
     $Settings.official_to_discord = $chkOfficial.Checked
     $Settings.auto_update = $chkUpdate.Checked
+    $Settings.overlay_enabled = $chkOverlay.Checked
+    # a shortcut that can't be used is put back to the last good one
+    if (ConvertTo-Hotkey $txtHotkey.Text) { $Settings.overlay_hotkey = $txtHotkey.Text.Trim() } else { $txtHotkey.Text = "$($Settings.overlay_hotkey)" }
     Save-Settings $Settings
+    Set-OverlayHotkey
 }
 function Append-Log($line) {
     $log.AppendText($line + [Environment]::NewLine)
@@ -1641,7 +1656,7 @@ function Stop-Presence {
     $btnToggle.Enabled = $false; $form.Cursor = 'WaitCursor'
     Stop-Block $script:Job $Sync 8000
     $script:Job = $null
-    $Sync.Status = 'Stopped'; $Sync.RunningIds = @()
+    $Sync.Status = 'Stopped'; $Sync.RunningIds = @(); $Sync.Now = $null
     $btnToggle.Text = 'Start presence'; $btnToggle.Enabled = $true; $form.Cursor = 'Default'
 }
 function Start-Scan {
@@ -1905,6 +1920,775 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $tray.ContextMenuStrip = $menu
 $tray.add_DoubleClick({ $form.Show(); $form.WindowState = 'Normal'; $form.Activate() })
 
+# ===========================================================================
+# OVERLAY - a panel over the game (Ctrl+Alt+G by default): music, volume, games, OBS, lights, Discord.
+# It is an ordinary always-on-top window - nothing is put inside the game - so it shows over
+# borderless and windowed games, not over true exclusive fullscreen.
+# ===========================================================================
+$OverlayCode = @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows.Forms;
+
+// A keyboard shortcut that works while a game has the keyboard.
+public class RPHotkey : NativeWindow, IDisposable {
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+    public event EventHandler Pressed;
+    bool on;
+    public RPHotkey() { CreateHandle(new CreateParams()); }
+    public bool Set(uint mods, uint vk) {
+        if (on) { UnregisterHotKey(Handle, 1); on = false; }
+        if (vk != 0) on = RegisterHotKey(Handle, 1, mods | 0x4000, vk);     // 0x4000 = no auto-repeat
+        return on;
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == 0x0312 && Pressed != null) Pressed(this, EventArgs.Empty);
+        base.WndProc(ref m);
+    }
+    public void Dispose() { if (on) UnregisterHotKey(Handle, 1); on = false; DestroyHandle(); }
+}
+
+// Media keys: play/pause, next, previous go to whichever player Windows treats as current.
+public static class RPKeys {
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    public static void Tap(byte vk) { keybd_event(vk, 0, 1, UIntPtr.Zero); keybd_event(vk, 0, 3, UIntPtr.Zero); }
+}
+
+// ------------------------------------------------------------------ volume: the PC's and each app's
+public class RPAudioSession { public int Pid; public string Name; public float Volume; public bool Mute; }
+
+public static class RPAudio {
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumerator { }
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator {
+        [PreserveSig] int EnumAudioEndpoints(int flow, int mask, out IntPtr devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice dev);
+    }
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice {
+        [PreserveSig] int Activate(ref Guid iid, int ctx, IntPtr p, [MarshalAs(UnmanagedType.IUnknown)] out object o);
+    }
+    [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioEndpointVolume {
+        [PreserveSig] int RegisterControlChangeNotify(IntPtr p);
+        [PreserveSig] int UnregisterControlChangeNotify(IntPtr p);
+        [PreserveSig] int GetChannelCount(out int c);
+        [PreserveSig] int SetMasterVolumeLevel(float db, ref Guid ctx);
+        [PreserveSig] int SetMasterVolumeLevelScalar(float v, ref Guid ctx);
+        [PreserveSig] int GetMasterVolumeLevel(out float db);
+        [PreserveSig] int GetMasterVolumeLevelScalar(out float v);
+        [PreserveSig] int SetChannelVolumeLevel(uint ch, float db, ref Guid ctx);
+        [PreserveSig] int SetChannelVolumeLevelScalar(uint ch, float v, ref Guid ctx);
+        [PreserveSig] int GetChannelVolumeLevel(uint ch, out float db);
+        [PreserveSig] int GetChannelVolumeLevelScalar(uint ch, out float v);
+        [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool m, ref Guid ctx);
+        [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool m);
+    }
+    [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionManager2 {
+        [PreserveSig] int GetAudioSessionControl(IntPtr a, int b, out IntPtr c);
+        [PreserveSig] int GetSimpleAudioVolume(IntPtr a, int b, out IntPtr c);
+        [PreserveSig] int GetSessionEnumerator(out IAudioSessionEnumerator e);
+    }
+    [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionEnumerator {
+        [PreserveSig] int GetCount(out int n);
+        [PreserveSig] int GetSession(int i, out IAudioSessionControl2 s);
+    }
+    [ComImport, Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionControl2 {
+        [PreserveSig] int GetState(out int state);
+        [PreserveSig] int GetDisplayName([MarshalAs(UnmanagedType.LPWStr)] out string name);
+        [PreserveSig] int SetDisplayName([MarshalAs(UnmanagedType.LPWStr)] string name, ref Guid ctx);
+        [PreserveSig] int GetIconPath([MarshalAs(UnmanagedType.LPWStr)] out string path);
+        [PreserveSig] int SetIconPath([MarshalAs(UnmanagedType.LPWStr)] string path, ref Guid ctx);
+        [PreserveSig] int GetGroupingParam(out Guid g);
+        [PreserveSig] int SetGroupingParam(ref Guid g, ref Guid ctx);
+        [PreserveSig] int RegisterAudioSessionNotification(IntPtr p);
+        [PreserveSig] int UnregisterAudioSessionNotification(IntPtr p);
+        [PreserveSig] int GetSessionIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        [PreserveSig] int GetSessionInstanceIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        [PreserveSig] int GetProcessId(out uint pid);
+        [PreserveSig] int IsSystemSoundsSession();
+        [PreserveSig] int SetDuckingPreference([MarshalAs(UnmanagedType.Bool)] bool optOut);
+    }
+    [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ISimpleAudioVolume {
+        [PreserveSig] int SetMasterVolume(float v, ref Guid ctx);
+        [PreserveSig] int GetMasterVolume(out float v);
+        [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool m, ref Guid ctx);
+        [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool m);
+    }
+
+    static IMMDevice Device() {
+        IMMDeviceEnumerator en = (IMMDeviceEnumerator)(new MMDeviceEnumerator());
+        IMMDevice dev;
+        if (en.GetDefaultAudioEndpoint(0, 1, out dev) != 0 || dev == null) throw new InvalidOperationException("No speakers or headphones found.");
+        return dev;
+    }
+    static IAudioEndpointVolume Endpoint() {
+        Guid iid = typeof(IAudioEndpointVolume).GUID; object o;
+        if (Device().Activate(ref iid, 23, IntPtr.Zero, out o) != 0) throw new InvalidOperationException("Volume isn't available.");
+        return (IAudioEndpointVolume)o;
+    }
+    public static float GetMaster() { float v; Endpoint().GetMasterVolumeLevelScalar(out v); return v; }
+    public static void SetMaster(float v) { Guid g = Guid.Empty; Endpoint().SetMasterVolumeLevelScalar(Math.Max(0f, Math.Min(1f, v)), ref g); }
+    public static bool GetMasterMute() { bool m; Endpoint().GetMute(out m); return m; }
+    public static void SetMasterMute(bool m) { Guid g = Guid.Empty; Endpoint().SetMute(m, ref g); }
+
+    delegate void Each(IAudioSessionControl2 c, ISimpleAudioVolume v, int pid);
+    static void Walk(Each fn) {
+        Guid iid = typeof(IAudioSessionManager2).GUID; object o;
+        if (Device().Activate(ref iid, 23, IntPtr.Zero, out o) != 0) return;
+        IAudioSessionEnumerator en;
+        if (((IAudioSessionManager2)o).GetSessionEnumerator(out en) != 0 || en == null) return;
+        int n; en.GetCount(out n);
+        for (int i = 0; i < n; i++) {
+            IAudioSessionControl2 c;
+            if (en.GetSession(i, out c) != 0 || c == null) continue;
+            int state; c.GetState(out state);
+            if (state == 2) continue;                       // expired
+            uint pid; c.GetProcessId(out pid);
+            ISimpleAudioVolume v = c as ISimpleAudioVolume;
+            if (v != null) fn(c, v, (int)pid);
+        }
+    }
+    // one entry per app that has made sound; the system sounds come first
+    public static RPAudioSession[] Sessions() {
+        Dictionary<int, RPAudioSession> byPid = new Dictionary<int, RPAudioSession>();
+        List<RPAudioSession> list = new List<RPAudioSession>();
+        Walk(delegate(IAudioSessionControl2 c, ISimpleAudioVolume v, int pid) {
+            if (byPid.ContainsKey(pid)) return;
+            RPAudioSession s = new RPAudioSession();
+            s.Pid = pid; v.GetMasterVolume(out s.Volume); v.GetMute(out s.Mute);
+            if (pid == 0 || c.IsSystemSoundsSession() == 0) { s.Name = "System sounds"; }
+            else {
+                try {
+                    using (Process p = Process.GetProcessById(pid)) {
+                        s.Name = p.ProcessName;
+                        try { string d = p.MainModule.FileVersionInfo.FileDescription; if (!string.IsNullOrWhiteSpace(d)) s.Name = d.Trim(); } catch { }
+                    }
+                } catch { return; }                         // the app has closed
+            }
+            byPid[pid] = s;
+            if (s.Name == "System sounds") list.Insert(0, s); else list.Add(s);
+        });
+        return list.ToArray();
+    }
+    public static void SetSession(int pid, float vol) {
+        Walk(delegate(IAudioSessionControl2 c, ISimpleAudioVolume v, int p) {
+            if (p == pid) { Guid g = Guid.Empty; v.SetMasterVolume(Math.Max(0f, Math.Min(1f, vol)), ref g); }
+        });
+    }
+    public static void SetSessionMute(int pid, bool mute) {
+        Walk(delegate(IAudioSessionControl2 c, ISimpleAudioVolume v, int p) {
+            if (p == pid) { Guid g = Guid.Empty; v.SetMute(mute, ref g); }
+        });
+    }
+}
+
+// ------------------------------------------------------------------ lights follow the screen (through OpenRGB)
+// OpenRGB has to be open with its SDK server running (port 6742). Works on its own thread.
+public class RPRgb {
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+    [DllImport("gdi32.dll")] static extern bool StretchBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int sw, int sh, uint rop);
+    [DllImport("gdi32.dll")] static extern int SetStretchBltMode(IntPtr dc, int mode);
+
+    public volatile string Status = "Off";
+    public volatile int Color = 0;              // 0xRRGGBB last sent
+    public volatile int Brightness = 100;       // percent
+    public volatile int Devices = 0;
+    volatile bool stop = true;
+    volatile int gen = 0;                       // each Start gets its own number, so an old thread can tell it was replaced
+    string host = "127.0.0.1"; int port = 6742;
+
+    public bool Running { get { return !stop; } }
+    public void Start(string h, int p) {
+        if (!stop) return;
+        if (!string.IsNullOrWhiteSpace(h)) host = h.Trim();
+        if (p > 0) port = p;
+        int g = ++gen;
+        stop = false; Status = "Connecting to OpenRGB...";
+        Thread t = new Thread(delegate() { Run(g); }); t.IsBackground = true; t.Start();
+    }
+    public void Stop() { stop = true; Status = "Off"; }
+    bool Live(int g) { return !stop && gen == g; }
+
+    static void Send(NetworkStream s, uint dev, uint id, byte[] data) {
+        int n = data == null ? 0 : data.Length;
+        byte[] b = new byte[16 + n];
+        b[0] = (byte)'O'; b[1] = (byte)'R'; b[2] = (byte)'G'; b[3] = (byte)'B';
+        BitConverter.GetBytes(dev).CopyTo(b, 4); BitConverter.GetBytes(id).CopyTo(b, 8); BitConverter.GetBytes((uint)n).CopyTo(b, 12);
+        if (n > 0) data.CopyTo(b, 16);
+        s.Write(b, 0, b.Length);
+    }
+    static byte[] ReadN(NetworkStream s, int n) {
+        byte[] b = new byte[n]; int got = 0;
+        while (got < n) { int r = s.Read(b, got, n - got); if (r <= 0) throw new Exception("OpenRGB closed the connection."); got += r; }
+        return b;
+    }
+    // the reply to a request; anything else the server sends on its own in between is skipped
+    static byte[] Reply(NetworkStream s, uint want) {
+        for (int i = 0; i < 50; i++) {
+            byte[] h = ReadN(s, 16);
+            uint id = BitConverter.ToUInt32(h, 8); int size = (int)BitConverter.ToUInt32(h, 12);
+            if (size < 0 || size > 8000000) throw new Exception("OpenRGB sent something unexpected.");
+            byte[] d = ReadN(s, size);
+            if (id == want) return d;
+        }
+        throw new Exception("OpenRGB didn't answer.");
+    }
+    static void Skip(byte[] d, ref int o) { int n = BitConverter.ToUInt16(d, o); o += 2 + n; }
+    // how many lights a device has (device description, protocol version 0)
+    public static int CountLeds(byte[] d) {
+        int o = 8;                                          // size + device type
+        for (int i = 0; i < 5; i++) Skip(d, ref o);         // name, description, version, serial, location
+        int modes = BitConverter.ToUInt16(d, o); o += 2 + 4;    // count + active mode
+        for (int i = 0; i < modes; i++) {
+            Skip(d, ref o); o += 36;
+            int nc = BitConverter.ToUInt16(d, o); o += 2 + 4 * nc;
+        }
+        int zones = BitConverter.ToUInt16(d, o); o += 2;
+        int sum = 0;
+        for (int i = 0; i < zones; i++) {
+            Skip(d, ref o); o += 12;
+            sum += (int)BitConverter.ToUInt32(d, o); o += 4;
+            int ml = BitConverter.ToUInt16(d, o); o += 2 + ml;
+        }
+        int leds = BitConverter.ToUInt16(d, o);
+        return leds > 0 ? leds : sum;
+    }
+    // the devices' light counts, without changing anything on them
+    public static int[] Probe(string host, int port) {
+        using (TcpClient c = new TcpClient()) {
+            c.Connect(host, port);
+            c.ReceiveTimeout = 4000; c.SendTimeout = 4000;
+            return Describe(c.GetStream());
+        }
+    }
+    static int[] Describe(NetworkStream s) {
+        Send(s, 0, 50, Encoding.ASCII.GetBytes("RichPresence\0"));
+        Send(s, 0, 0, null);
+        int count = (int)BitConverter.ToUInt32(Reply(s, 0), 0);
+        int[] leds = new int[count];
+        for (int i = 0; i < count; i++) {
+            Send(s, (uint)i, 1, null);
+            try { leds[i] = CountLeds(Reply(s, 1)); } catch (ArgumentException) { leds[i] = 0; } catch (IndexOutOfRangeException) { leds[i] = 0; }
+        }
+        return leds;
+    }
+
+    int ScreenColor(Bitmap bmp) {
+        int sw = GetSystemMetrics(0), sh = GetSystemMetrics(1);
+        using (Graphics g = Graphics.FromImage(bmp)) {
+            IntPtr dst = g.GetHdc(); IntPtr src = GetDC(IntPtr.Zero);
+            try { SetStretchBltMode(dst, 3); StretchBlt(dst, 0, 0, bmp.Width, bmp.Height, src, 0, 0, sw, sh, 0x00CC0020); }
+            finally { ReleaseDC(IntPtr.Zero, src); g.ReleaseHdc(dst); }
+        }
+        long r = 0, gg = 0, b = 0, w = 0;
+        for (int y = 0; y < bmp.Height; y++) for (int x = 0; x < bmp.Width; x++) {
+            Color c = bmp.GetPixel(x, y);
+            int max = Math.Max(c.R, Math.Max(c.G, c.B)), min = Math.Min(c.R, Math.Min(c.G, c.B));
+            int wt = 1 + (max - min);                       // colourful pixels count more than grey ones
+            r += c.R * wt; gg += c.G * wt; b += c.B * wt; w += wt;
+        }
+        if (w == 0) return 0;
+        return ((int)(r / w) << 16) | ((int)(gg / w) << 8) | (int)(b / w);
+    }
+
+    void Run(int g) {
+        double cr = 0, cg = 0, cb = 0;
+        using (Bitmap bmp = new Bitmap(48, 27)) {
+            while (Live(g)) {
+                try {
+                    using (TcpClient c = new TcpClient()) {
+                        c.Connect(host, port);
+                        c.ReceiveTimeout = 4000; c.SendTimeout = 4000;
+                        NetworkStream s = c.GetStream();
+                        int[] leds = Describe(s);
+                        for (int i = 0; i < leds.Length; i++) if (leds[i] > 0) Send(s, (uint)i, 1100, null);    // "direct" mode
+                        Devices = leds.Length;
+                        Status = leds.Length == 0 ? "OpenRGB found no lights" : "Syncing " + leds.Length + (leds.Length == 1 ? " device" : " devices");
+                        int last = -1; DateTime sent = DateTime.MinValue;
+                        while (Live(g)) {
+                            int col = ScreenColor(bmp);
+                            double k = Brightness / 100.0;
+                            cr += (((col >> 16) & 255) * k - cr) * 0.35; cg += (((col >> 8) & 255) * k - cg) * 0.35; cb += ((col & 255) * k - cb) * 0.35;
+                            int now = ((int)cr << 16) | ((int)cg << 8) | (int)cb;
+                            if (now != last || (DateTime.UtcNow - sent).TotalSeconds > 2) {
+                                for (int i = 0; i < leds.Length; i++) {
+                                    int n = leds[i]; if (n <= 0) continue;
+                                    byte[] d = new byte[6 + 4 * n];
+                                    BitConverter.GetBytes((uint)d.Length).CopyTo(d, 0); BitConverter.GetBytes((ushort)n).CopyTo(d, 4);
+                                    for (int j = 0; j < n; j++) { d[6 + 4 * j] = (byte)cr; d[7 + 4 * j] = (byte)cg; d[8 + 4 * j] = (byte)cb; }
+                                    Send(s, (uint)i, 1050, d);
+                                }
+                                last = now; sent = DateTime.UtcNow; Color = now;
+                            }
+                            while (c.Available > 0) s.ReadByte();   // drop notices the server sends on its own
+                            Thread.Sleep(66);
+                        }
+                    }
+                } catch (Exception e) {
+                    if (!Live(g)) break;
+                    Status = e is SocketException ? "OpenRGB isn't running (or its SDK server is off)" : e.Message;
+                    for (int i = 0; i < 30 && Live(g); i++) Thread.Sleep(100);
+                }
+            }
+        }
+        if (gen == g) Status = "Off";
+    }
+}
+
+// ------------------------------------------------------------------ OBS (its built-in WebSocket server, v5)
+public class RPObs {
+    public volatile bool Connected, Recording, Streaming, Replay;
+    public volatile string Status = "Off", Scene = "";
+    public volatile string[] Scenes = new string[0];
+    volatile bool stop = true;
+    Thread thread; int port; string password;
+    readonly Queue<string> cmds = new Queue<string>();
+    readonly AutoResetEvent wake = new AutoResetEvent(false);
+    int nextId;
+
+    public bool Running { get { return !stop; } }
+    public void Start(int p, string pass) {
+        if (!stop) return;
+        port = p > 0 ? p : 4455; password = pass ?? "";
+        stop = false; Status = "Looking for OBS...";
+        thread = new Thread(Run); thread.IsBackground = true; thread.Start();
+    }
+    public void Stop() { stop = true; wake.Set(); }
+    static string Esc(string s) { return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\""); }
+    // "ToggleRecord", "ToggleStream", "ToggleReplayBuffer", "SaveReplayBuffer"
+    public void Do(string request) { lock (cmds) cmds.Enqueue("\"requestType\":\"" + Esc(request) + "\""); wake.Set(); }
+    public void SetScene(string name) {
+        lock (cmds) cmds.Enqueue("\"requestType\":\"SetCurrentProgramScene\",\"requestData\":{\"sceneName\":\"" + Esc(name) + "\"}");
+        wake.Set();
+    }
+
+    static void SendText(ClientWebSocket ws, string text) {
+        byte[] b = Encoding.UTF8.GetBytes(text);
+        if (!ws.SendAsync(new ArraySegment<byte>(b), WebSocketMessageType.Text, true, CancellationToken.None).Wait(4000)) throw new Exception("OBS didn't answer.");
+    }
+    static string Recv(ClientWebSocket ws) {
+        byte[] buf = new byte[16384]; StringBuilder sb = new StringBuilder();
+        while (true) {
+            var t = ws.ReceiveAsync(new ArraySegment<byte>(buf), CancellationToken.None);
+            if (!t.Wait(4000)) throw new Exception("OBS didn't answer.");
+            if (t.Result.MessageType == WebSocketMessageType.Close) {
+                throw new Exception((int)(ws.CloseStatus ?? 0) == 4009 ? "OBS didn't accept the WebSocket password" : "OBS closed the connection.");
+            }
+            sb.Append(Encoding.UTF8.GetString(buf, 0, t.Result.Count));
+            if (t.Result.EndOfMessage) return sb.ToString();
+        }
+    }
+    static string Str(string json, string key) {
+        Match m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+        if (!m.Success) return "";
+        try { return Regex.Unescape(m.Groups[1].Value); } catch { return m.Groups[1].Value; }
+    }
+    static bool Active(string json) { return Regex.IsMatch(json, "\"outputActive\"\\s*:\\s*true"); }
+    static string Hash(string s) { using (SHA256 h = SHA256.Create()) return Convert.ToBase64String(h.ComputeHash(Encoding.UTF8.GetBytes(s))); }
+    string Ask(ClientWebSocket ws, string body) {
+        string id = "rp" + (++nextId);
+        SendText(ws, "{\"op\":6,\"d\":{" + body + ",\"requestId\":\"" + id + "\"}}");
+        for (int i = 0; i < 20; i++) { string r = Recv(ws); if (r.Contains("\"" + id + "\"")) return r; }
+        throw new Exception("OBS didn't answer.");
+    }
+
+    void Run() {
+        while (!stop) {
+            try {
+                using (ClientWebSocket ws = new ClientWebSocket()) {
+                    if (!ws.ConnectAsync(new Uri("ws://127.0.0.1:" + port), CancellationToken.None).Wait(4000)) throw new Exception("OBS isn't open");
+                    string hello = Recv(ws);
+                    string auth = "";
+                    string challenge = Str(hello, "challenge"), salt = Str(hello, "salt");
+                    if (challenge != "") {
+                        if (password == "") throw new Exception("OBS wants its WebSocket password");
+                        auth = ",\"authentication\":\"" + Hash(Hash(password + salt) + challenge) + "\"";
+                    }
+                    SendText(ws, "{\"op\":1,\"d\":{\"rpcVersion\":1,\"eventSubscriptions\":0" + auth + "}}");
+                    Recv(ws);
+                    Connected = true;
+                    while (!stop) {
+                        while (true) {
+                            string cmd = null;
+                            lock (cmds) { if (cmds.Count > 0) cmd = cmds.Dequeue(); }
+                            if (cmd == null) break;
+                            Ask(ws, cmd);
+                        }
+                        Recording = Active(Ask(ws, "\"requestType\":\"GetRecordStatus\""));
+                        Streaming = Active(Ask(ws, "\"requestType\":\"GetStreamStatus\""));
+                        Replay = Active(Ask(ws, "\"requestType\":\"GetReplayBufferStatus\""));
+                        string sc = Ask(ws, "\"requestType\":\"GetSceneList\"");
+                        Scene = Str(sc, "currentProgramSceneName");
+                        List<string> names = new List<string>();
+                        foreach (Match m in Regex.Matches(sc, "\"sceneName\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")) {
+                            string n; try { n = Regex.Unescape(m.Groups[1].Value); } catch { n = m.Groups[1].Value; }
+                            names.Insert(0, n);                     // OBS lists them bottom to top
+                        }
+                        Scenes = names.ToArray();
+                        Status = Recording && Streaming ? "Recording and live" : Recording ? "Recording" : Streaming ? "Live" : "Connected";
+                        wake.WaitOne(1000);
+                    }
+                }
+            } catch (Exception e) {
+                Exception inner = e; while (inner.InnerException != null) inner = inner.InnerException;
+                string msg = inner.Message;
+                if (inner is WebSocketException || inner is SocketException) msg = Connected ? "OBS closed" : "OBS isn't open (or its WebSocket server is off)";
+                Connected = false; Recording = false; Streaming = false; Replay = false;
+                if (stop) break;
+                Status = msg;
+                lock (cmds) cmds.Clear();
+                for (int i = 0; i < 30 && !stop; i++) Thread.Sleep(100);
+            }
+        }
+        Connected = false; Status = "Off";
+    }
+}
+'@
+
+$script:Hotkey = $null; $script:Rgb = $null; $script:Obs = $null; $script:OvOk = $false
+try {
+    if (-not ('RPHotkey' -as [type])) { Add-Type -TypeDefinition $OverlayCode -ReferencedAssemblies System.Windows.Forms, System.Drawing }
+    $script:Hotkey = New-Object RPHotkey; $script:Rgb = New-Object RPRgb; $script:Obs = New-Object RPObs
+    $script:OvOk = $true
+} catch { Append-Log ("[{0}] The overlay couldn't be set up: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message) }
+
+# "Ctrl+Alt+G" -> what Windows needs to register it; $null when it isn't a usable shortcut
+function ConvertTo-Hotkey($text) {
+    $mods = 0; $vk = 0
+    foreach ($tok in @("$text" -split '\+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        if ($tok -match '^(ctrl|control)$') { $mods = $mods -bor 2 }
+        elseif ($tok -match '^alt$') { $mods = $mods -bor 1 }
+        elseif ($tok -match '^shift$') { $mods = $mods -bor 4 }
+        elseif ($tok -match '^win(dows)?$') { $mods = $mods -bor 8 }
+        else {
+            if ($vk) { return $null }
+            $name = if ($tok -match '^\d$') { "D$tok" } else { $tok }
+            try { $vk = [int][System.Enum]::Parse([System.Windows.Forms.Keys], $name, $true) } catch { return $null }
+        }
+    }
+    if ($vk -lt 8 -or $vk -gt 254) { return $null }
+    if (-not $mods -and ($vk -lt 0x70 -or $vk -gt 0x87)) { return $null }     # a bare key only if it's F1-F24
+    @{ Mods = $mods; Vk = $vk }
+}
+function Set-OverlayHotkey {
+    if (-not $script:OvOk) { return }
+    $want = if ($Settings.overlay_enabled) { "$($Settings.overlay_hotkey)" } else { '' }
+    if ($want -eq $script:HotkeySet) { return }
+    $script:HotkeySet = $want
+    if (-not $want) { [void]$script:Hotkey.Set(0, 0); return }
+    $hk = ConvertTo-Hotkey $want
+    if (-not $hk -or -not $script:Hotkey.Set([uint32]$hk.Mods, [uint32]$hk.Vk)) {
+        Append-Log ("[{0}] The overlay shortcut {1} couldn't be used (another program has it?). Pick another under Settings." -f (Get-Date -Format 'HH:mm:ss'), $want)
+    }
+}
+
+$cKey = C '#010201'
+$fOvIcon = New-Object System.Drawing.Font('Segoe MDL2 Assets', 14)
+$fOvBig  = New-Object System.Drawing.Font('Segoe UI Semibold', 13)
+$fOvLine = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Italic)
+
+$ovDim = New-Object System.Windows.Forms.Form
+$ovDim.FormBorderStyle = 'None'; $ovDim.ShowInTaskbar = $false; $ovDim.TopMost = $true; $ovDim.StartPosition = 'Manual'
+$ovDim.BackColor = [System.Drawing.Color]::Black; $ovDim.Opacity = 0.6
+$ov = New-Object System.Windows.Forms.Form
+$ov.FormBorderStyle = 'None'; $ov.ShowInTaskbar = $false; $ov.TopMost = $true; $ov.StartPosition = 'Manual'
+$ov.BackColor = $cKey; $ov.TransparencyKey = $cKey; $ov.KeyPreview = $true; $ov.Owner = $ovDim
+$ov.Font = $fUi; $ov.ForeColor = $cText; $ov.Text = 'RichPresence overlay'
+$ovRoot = New-Ctl System.Windows.Forms.Panel $ov @{ Size = (Sz 1172 700); BackColor = $cKey }
+
+function New-OvWidget($title, $x, $y, $w, $h) {
+    $p = New-Ctl System.Windows.Forms.Panel $ovRoot @{ Location = (Pt $x $y); Size = (Sz $w $h); BackColor = $cCard }
+    [void](New-Ctl System.Windows.Forms.Label $p @{ Text = $title; UseMnemonic = $false; Font = $fBold; ForeColor = $cDim; Location = (Pt 12 8); AutoSize = $true })
+    $p
+}
+function New-OvButton($parent, $text, $x, $y, $w, $h) {
+    $b = New-Ctl System.Windows.Forms.Button $parent @{ Text = $text; UseMnemonic = $false; Location = (Pt $x $y); Size = (Sz $w $h) }
+    Style-Button $b $false; $b.Font = $fUi
+    $b
+}
+
+# ---- top bar
+$ovTop = New-Ctl System.Windows.Forms.Panel $ovRoot @{ Location = (Pt 0 0); Size = (Sz 1172 44); BackColor = $cSide }
+[void](New-Ctl System.Windows.Forms.Label $ovTop @{ Text = 'RichPresence'; Font = $fOvBig; Location = (Pt 12 9); AutoSize = $true })
+$ovHint  = New-Ctl System.Windows.Forms.Label $ovTop @{ Text = ''; ForeColor = $cDim; Location = (Pt 150 14); Size = (Sz 600 20) }
+$ovClock = New-Ctl System.Windows.Forms.Label $ovTop @{ Text = ''; Font = $fOvBig; TextAlign = 'MiddleRight'; Location = (Pt 960 8); Size = (Sz 150 28) }
+$ovClose = New-OvButton $ovTop ([string][char]0xE711) 1122 6 40 32
+$ovClose.Font = $fOvIcon
+
+# ---- music
+$ovMedia = New-OvWidget 'Music' 0 56 380 190
+$ovSong   = New-Ctl System.Windows.Forms.Label $ovMedia @{ Text = ''; UseMnemonic = $false; Font = $fOvBig; Location = (Pt 12 34); Size = (Sz 356 26); AutoEllipsis = $true }
+$ovArtist = New-Ctl System.Windows.Forms.Label $ovMedia @{ Text = ''; UseMnemonic = $false; ForeColor = $cDim; Location = (Pt 13 62); Size = (Sz 356 20); AutoEllipsis = $true }
+$ovLine   = New-Ctl System.Windows.Forms.Label $ovMedia @{ Text = ''; UseMnemonic = $false; Font = $fOvLine; ForeColor = $cAccent; Location = (Pt 13 86); Size = (Sz 356 42) }
+$ovPrev = New-OvButton $ovMedia ([string][char]0xE892) 12 138 112 40
+$ovPlay = New-OvButton $ovMedia ([string][char]0xE768) 134 138 112 40
+$ovNext = New-OvButton $ovMedia ([string][char]0xE893) 256 138 112 40
+foreach ($b in $ovPrev, $ovPlay, $ovNext) { $b.Font = $fOvIcon }
+$ovPrev.Tag = 0xB1; $ovPlay.Tag = 0xB3; $ovNext.Tag = 0xB0
+foreach ($b in $ovPrev, $ovPlay, $ovNext) { $b.add_Click({ try { [RPKeys]::Tap([byte]$this.Tag) } catch {} }) }
+
+# ---- Discord
+$ovDiscord = New-OvWidget 'Discord' 0 258 380 250
+$ovDStatus = New-Ctl System.Windows.Forms.Label $ovDiscord @{ Text = ''; UseMnemonic = $false; Location = (Pt 13 34); Size = (Sz 356 36) }
+$ovDToggle = New-OvButton $ovDiscord 'Start presence' 12 74 172 34
+$ovDOpen   = New-OvButton $ovDiscord 'Open Discord' 196 74 172 34
+[void](New-Ctl System.Windows.Forms.Label $ovDiscord @{ Text = 'Custom statuses'; ForeColor = $cDim; Location = (Pt 13 118); AutoSize = $true })
+$ovDList = New-Ctl System.Windows.Forms.CheckedListBox $ovDiscord @{ Location = (Pt 13 140); Size = (Sz 355 100); BackColor = $cCardHi; ForeColor = $cText; BorderStyle = 'None'; CheckOnClick = $true; IntegralHeight = $false }
+$ovDToggle.add_Click({ if ($script:Job) { Stop-Presence } else { Start-Presence } })
+$ovDOpen.add_Click({ Hide-Overlay; try { Start-Process 'discord://-/channels/@me' } catch {} })
+$ovDList.add_ItemCheck({
+    param($s, $e)
+    if ($script:OvLoading) { return }
+    # the Custom status page owns the list: ticking its box there saves and sends it
+    if ($e.Index -lt $lstC.Items.Count) { $lstC.SetItemChecked($e.Index, ($e.NewValue -eq 'Checked')) }
+})
+
+# ---- Steam, Xbox, PlayStation
+$ovStores = New-OvWidget 'Steam, Xbox & PlayStation' 0 520 380 180
+$storeRows = @(
+    @('Steam', @(@('Library', 'steam://open/games'), @('Big Picture', 'steam://open/bigpicture'), @('Friends', 'steam://open/friends'))),
+    @('Xbox', @(@('Xbox app', 'shell:AppsFolder\Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App'), @('Cloud', 'https://www.xbox.com/play'), @('Profile', 'https://account.xbox.com/Profile'))),
+    @('PlayStation', @(@('Remote Play', 'psremoteplay'), @('Library', 'https://library.playstation.com/'), @('Store', 'https://store.playstation.com/')))
+)
+$sy = 38
+foreach ($row in $storeRows) {
+    [void](New-Ctl System.Windows.Forms.Label $ovStores @{ Text = $row[0]; ForeColor = $cDim; Location = (Pt 13 ($sy + 8)); Size = (Sz 76 20) })
+    $sx = 92
+    foreach ($item in $row[1]) {
+        $b = New-OvButton $ovStores $item[0] $sx $sy 90 34
+        $b.Tag = $item[1]; $sx += 94
+        $b.add_Click({
+            Hide-Overlay
+            try {
+                $t = "$($this.Tag)"
+                if ($t -eq 'psremoteplay') {
+                    $exe = Join-Path ${env:ProgramFiles(x86)} 'Sony\PS Remote Play\RemotePlay.exe'
+                    if (Test-Path $exe) { Start-Process $exe } else { Start-Process 'https://remoteplay.dl.playstation.net/remoteplay/' }
+                }
+                elseif ($t -like 'shell:*') { Start-Process 'explorer.exe' $t }
+                else { Start-Process $t }
+            } catch { Append-Log ("[{0}] Couldn't open that: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message) }
+        })
+    }
+    $sy += 44
+}
+
+# ---- volume
+$ovAudio = New-OvWidget 'Volume' 396 56 380 330
+function New-OvVolRow($parent, $name, $y, $procId) {
+    $lbl = New-Ctl System.Windows.Forms.Label $parent @{ Text = $name; UseMnemonic = $false; Location = (Pt 0 ($y + 6)); Size = (Sz 116 20); AutoEllipsis = $true }
+    $bar = New-Ctl System.Windows.Forms.TrackBar $parent @{ AutoSize = $false; Location = (Pt 116 $y); Size = (Sz 176 30); Maximum = 100; TickStyle = 'None'; BackColor = $cCard; Tag = $procId }
+    $mute = New-Ctl System.Windows.Forms.CheckBox $parent @{ Text = 'Mute'; Location = (Pt 296 ($y + 4)); AutoSize = $true; ForeColor = $cDim; Tag = $procId }
+    $bar.add_Scroll({
+        try { if ([int]$this.Tag -lt 0) { [RPAudio]::SetMaster($this.Value / 100) } else { [RPAudio]::SetSession([int]$this.Tag, $this.Value / 100) } } catch {}
+    })
+    $mute.add_Click({
+        try { if ([int]$this.Tag -lt 0) { [RPAudio]::SetMasterMute($this.Checked) } else { [RPAudio]::SetSessionMute([int]$this.Tag, $this.Checked) } } catch {}
+    })
+    @{ Label = $lbl; Bar = $bar; Mute = $mute }
+}
+$ovMasterBox = New-Ctl System.Windows.Forms.Panel $ovAudio @{ Location = (Pt 13 36); Size = (Sz 356 34) }
+$ovMaster = New-OvVolRow $ovMasterBox 'Everything' 0 -1
+$ovMaster.Label.Font = $fBold
+$ovMix = New-Ctl System.Windows.Forms.Panel $ovAudio @{ Location = (Pt 13 80); Size = (Sz 356 240) }
+$script:OvMixKey = $null; $script:OvMixRows = @()
+function Update-OvAudio {
+    if (-not $script:OvOk) { return }
+    try {
+        if (-not $ovMaster.Bar.Capture) { $ovMaster.Bar.Value = [int][math]::Round([RPAudio]::GetMaster() * 100) }
+        $ovMaster.Mute.Checked = [RPAudio]::GetMasterMute()
+        $list = @([RPAudio]::Sessions() | Select-Object -First 7)
+        $key = @($list | ForEach-Object { $_.Pid }) -join ','
+        if ($key -ne $script:OvMixKey) {
+            $script:OvMixKey = $key
+            foreach ($c in @($ovMix.Controls)) { $c.Dispose() }
+            $script:OvMixRows = @(); $y = 0
+            foreach ($s in $list) { $script:OvMixRows += (New-OvVolRow $ovMix $s.Name $y $s.Pid); $y += 34 }
+        }
+        for ($i = 0; $i -lt $list.Count -and $i -lt $script:OvMixRows.Count; $i++) {
+            $r = $script:OvMixRows[$i]
+            if (-not $r.Bar.Capture) { $r.Bar.Value = [int][math]::Round($list[$i].Volume * 100) }
+            $r.Mute.Checked = [bool]$list[$i].Mute
+        }
+    } catch {}
+}
+
+# ---- OBS
+$ovObs = New-OvWidget 'OBS' 396 398 380 170
+$ovObsStatus = New-Ctl System.Windows.Forms.Label $ovObs @{ Text = ''; UseMnemonic = $false; Location = (Pt 13 34); Size = (Sz 356 20) }
+$ovObsRec    = New-OvButton $ovObs 'Start recording' 12 60 114 36
+$ovObsLive   = New-OvButton $ovObs 'Go live' 132 60 114 36
+$ovObsReplay = New-OvButton $ovObs 'Save replay' 252 60 116 36
+[void](New-Ctl System.Windows.Forms.Label $ovObs @{ Text = 'Scene'; ForeColor = $cDim; Location = (Pt 13 114); AutoSize = $true })
+$ovObsScene = New-Ctl System.Windows.Forms.ComboBox $ovObs @{ DropDownStyle = 'DropDownList'; FlatStyle = 'Flat'; Location = (Pt 64 110); Size = (Sz 304 24); BackColor = $cCardHi; ForeColor = $cText }
+[void](New-Ctl System.Windows.Forms.Label $ovObs @{ Text = 'In OBS: Tools > WebSocket Server Settings > Enable.'; ForeColor = $cDim; Font = $fSmall; Location = (Pt 13 144); AutoSize = $true })
+$ovObsRec.add_Click({ if ($script:OvOk) { $script:Obs.Do('ToggleRecord') } })
+$ovObsLive.add_Click({ if ($script:OvOk) { $script:Obs.Do('ToggleStream') } })
+$ovObsReplay.add_Click({ if ($script:OvOk) { $script:Obs.Do($(if ($script:Obs.Replay) { 'SaveReplayBuffer' } else { 'ToggleReplayBuffer' })) } })
+$ovObsScene.add_SelectionChangeCommitted({ if ($script:OvOk -and $ovObsScene.SelectedItem) { $script:Obs.SetScene("$($ovObsScene.SelectedItem)") } })
+# OBS keeps its own port and password in its settings folder on this PC; they are read from there, never stored here
+function Start-OvObs {
+    if (-not $script:OvOk -or $script:Obs.Running) { return }
+    $port = 4455; $pass = ''
+    try {
+        $cfg = Get-Content (Join-Path $env:APPDATA 'obs-studio\plugin_config\obs-websocket\config.json') -Raw | ConvertFrom-Json
+        if ($cfg.server_port) { $port = [int]$cfg.server_port }
+        if ($cfg.auth_required) { $pass = "$($cfg.server_password)" }
+    } catch {}
+    $script:Obs.Start($port, $pass)
+}
+
+# ---- lights
+$ovRgb = New-OvWidget 'Lights' 396 580 380 120
+$ovRgbOn = New-Ctl System.Windows.Forms.CheckBox $ovRgb @{ Text = 'Match my lights to the screen'; Location = (Pt 13 34); AutoSize = $true }
+$ovRgbSwatch = New-Ctl System.Windows.Forms.Panel $ovRgb @{ Location = (Pt 332 32); Size = (Sz 36 22); BackColor = $cCardHi }
+[void](New-Ctl System.Windows.Forms.Label $ovRgb @{ Text = 'Brightness'; ForeColor = $cDim; Location = (Pt 13 66); AutoSize = $true })
+$ovRgbBright = New-Ctl System.Windows.Forms.TrackBar $ovRgb @{ AutoSize = $false; Location = (Pt 90 60); Size = (Sz 278 30); Minimum = 10; Maximum = 100; TickStyle = 'None'; BackColor = $cCard }
+$ovRgbStatus = New-Ctl System.Windows.Forms.Label $ovRgb @{ Text = ''; UseMnemonic = $false; ForeColor = $cDim; Font = $fSmall; Location = (Pt 13 94); Size = (Sz 356 18) }
+function Set-RgbSync($on) {
+    if (-not $script:OvOk) { return }
+    $script:Rgb.Brightness = [int]$Settings.rgb_brightness
+    if ($on) { $script:Rgb.Start('127.0.0.1', 6742) } else { $script:Rgb.Stop() }
+}
+$ovRgbOn.add_Click({ $Settings.rgb_sync = $ovRgbOn.Checked; Save-Settings $Settings; Set-RgbSync $ovRgbOn.Checked })
+$ovRgbBright.add_Scroll({ $Settings.rgb_brightness = $ovRgbBright.Value; if ($script:OvOk) { $script:Rgb.Brightness = $ovRgbBright.Value } })
+$ovRgbBright.add_MouseUp({ Save-Settings $Settings })
+
+# ---- games
+$ovGames = New-OvWidget 'Games' 792 56 380 644
+$ovSearch = New-Ctl System.Windows.Forms.TextBox $ovGames @{ Location = (Pt 13 36); Size = (Sz 354 24); BackColor = $cCardHi; ForeColor = $cText; BorderStyle = 'FixedSingle' }
+$ovGameList = New-Ctl System.Windows.Forms.FlowLayoutPanel $ovGames @{ Location = (Pt 13 68); Size = (Sz 360 566); AutoScroll = $true; FlowDirection = 'TopDown'; WrapContents = $false }
+$script:OvGameKey = $null; $script:OvGameRows = @()
+function Update-OvGames {
+    $key = @($script:Library | ForEach-Object { $_.id }) -join '|'
+    if ($key -ne $script:OvGameKey) {
+        $script:OvGameKey = $key
+        $ovGameList.SuspendLayout()
+        foreach ($r in $script:OvGameRows) { if ($r.Pic.Image) { $r.Pic.Image.Dispose() }; $r.Row.Dispose() }
+        $script:OvGameRows = @()
+        foreach ($g in $script:Library) {
+            $row = New-Ctl System.Windows.Forms.Panel $ovGameList @{ Size = (Sz 336 46); BackColor = $cCardHi; Cursor = 'Hand'; Tag = $g; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 0, 6)) }
+            $pic = New-Ctl System.Windows.Forms.PictureBox $row @{ Location = (Pt 7 7); Size = (Sz 32 32); SizeMode = 'Zoom'; Tag = $g }
+            $ico = $null
+            try { $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($g.icon); $pic.Image = $ico.ToBitmap() } catch {} finally { if ($ico) { $ico.Dispose() } }
+            $nm  = New-Ctl System.Windows.Forms.Label $row @{ Text = $g.name; UseMnemonic = $false; Font = $fBold; Location = (Pt 48 4); Size = (Sz 280 20); AutoEllipsis = $true; Tag = $g }
+            $sub = New-Ctl System.Windows.Forms.Label $row @{ Text = "$($g.store)"; ForeColor = $cDim; Font = $fSmall; Location = (Pt 49 25); Size = (Sz 280 16); Tag = $g }
+            foreach ($c in $row, $pic, $nm, $sub) { $c.add_Click({ $game = $this.Tag; Hide-Overlay; Play-Game $game }) }
+            $script:OvGameRows += @{ Row = $row; Pic = $pic; Sub = $sub; Game = $g }
+        }
+        $ovGameList.ResumeLayout()
+    }
+    $find = $ovSearch.Text.Trim()
+    foreach ($r in $script:OvGameRows) {
+        $isRun = @($Sync.RunningIds) -contains $r.Game.id
+        $r.Row.BackColor = $(if ($isRun) { C '#243a2e' } else { $cCardHi })
+        $r.Sub.Text = $(if ($isRun) { "$($r.Game.store)  -  Running" } else { "$($r.Game.store)" })
+        $r.Row.Visible = (-not $find) -or ("$($r.Game.name)".IndexOf($find, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+    }
+}
+$ovSearch.add_TextChanged({ Update-OvGames })
+
+# ---- show, hide, refresh
+$script:OvTick = 0; $script:OvLoading = $false
+$ovTimer = New-Object System.Windows.Forms.Timer
+$ovTimer.Interval = 500
+function Update-Overlay {
+    $ovClock.Text = (Get-Date).ToString('t')
+    $now = $Sync.Now
+    if ($script:Job -and $now -and $now.Title) {
+        $ovSong.Text = "$($now.Title)"
+        $ovArtist.Text = $(if ($now.Artist) { "$($now.Artist)  -  $($now.Player)" } else { "$($now.Player)" })
+        $ovLine.Text = "$($now.Line)"
+        $ovPlay.Text = [string][char]$(if ($now.Playing) { 0xE769 } else { 0xE768 })
+    } else {
+        $ovSong.Text = 'Nothing playing'
+        $ovArtist.Text = $(if ($script:Job) { 'Apple Music and Spotify show here with their lyrics.' } else { 'Start the presence to see the song and lyrics.' })
+        $ovLine.Text = ''; $ovPlay.Text = [string][char]0xE768
+    }
+    $ovDStatus.Text = $(if ($script:Job) { "Presence on: $($Sync.Status)" } else { 'Presence off' })
+    $ovDStatus.ForeColor = $(if ($script:Job) { $cGreen } else { $cDim })
+    $ovDToggle.Text = $(if ($script:Job) { 'Stop presence' } else { 'Start presence' })
+    if ($script:OvOk) {
+        $o = $script:Obs
+        $ovObsStatus.Text = "$($o.Status)"
+        $ovObsStatus.ForeColor = $(if ($o.Recording -or $o.Streaming) { C '#ed4245' } elseif ($o.Connected) { $cGreen } else { $cDim })
+        foreach ($b in $ovObsRec, $ovObsLive, $ovObsReplay) { $b.Enabled = [bool]$o.Connected }
+        $ovObsScene.Enabled = [bool]$o.Connected
+        $ovObsRec.Text = $(if ($o.Recording) { 'Stop recording' } else { 'Start recording' })
+        $ovObsLive.Text = $(if ($o.Streaming) { 'End stream' } else { 'Go live' })
+        $ovObsReplay.Text = $(if ($o.Replay) { 'Save replay' } else { 'Start replay' })
+        if (-not $ovObsScene.DroppedDown) {
+            $names = @($o.Scenes)
+            if (($names -join "`n") -ne (@($ovObsScene.Items) -join "`n")) { $ovObsScene.Items.Clear(); foreach ($n in $names) { [void]$ovObsScene.Items.Add($n) } }
+            if ("$($ovObsScene.SelectedItem)" -ne "$($o.Scene)") { $ovObsScene.SelectedItem = "$($o.Scene)" }
+        }
+        $ovRgbStatus.Text = $(if ($script:Rgb.Running) { "$($script:Rgb.Status)" } else { 'Needs OpenRGB open with its SDK server running.' })
+        $col = [int]$script:Rgb.Color
+        $ovRgbSwatch.BackColor = $(if ($script:Rgb.Running) { [System.Drawing.Color]::FromArgb(255, ($col -shr 16) -band 255, ($col -shr 8) -band 255, $col -band 255) } else { $cCardHi })
+    }
+    if ($script:OvTick % 4 -eq 0) { Update-OvAudio; Update-OvGames }
+    $script:OvTick++
+}
+$ovTimer.add_Tick({ try { Update-Overlay } catch {} })
+function Show-Overlay {
+    if ($ov.Visible) { return }
+    $b = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).Bounds
+    $ovDim.Bounds = $b; $ov.Bounds = $b
+    $ovRoot.Location = Pt ([math]::Max(0, [int](($b.Width - $ovRoot.Width) / 2))) ([math]::Max(0, [int](($b.Height - $ovRoot.Height) / 2)))
+    $ovHint.Text = "$($Settings.overlay_hotkey) or Esc to close"
+    $ovSearch.Text = ''
+    # the custom statuses, as the Custom status page has them
+    $script:OvLoading = $true
+    $ovDList.Items.Clear()
+    for ($i = 0; $i -lt $lstC.Items.Count; $i++) { [void]$ovDList.Items.Add("$($lstC.Items[$i])", $lstC.GetItemChecked($i)) }
+    $script:OvLoading = $false
+    $ovRgbOn.Checked = [bool]$Settings.rgb_sync
+    $ovRgbBright.Value = [math]::Max(10, [math]::Min(100, [int]$Settings.rgb_brightness))
+    Start-OvObs
+    $script:OvTick = 0
+    try { Update-Overlay } catch {}
+    $ovDim.Show(); $ov.Show(); $ov.Activate()
+    $ovTimer.Start()
+}
+function Hide-Overlay {
+    if (-not $ov.Visible) { return }
+    $ovTimer.Stop()
+    $ov.Hide(); $ovDim.Hide()
+}
+function Switch-Overlay { if ($ov.Visible) { Hide-Overlay } else { Show-Overlay } }
+$ovClose.add_Click({ Hide-Overlay })
+$ovDim.add_MouseDown({ Hide-Overlay })
+$ov.add_MouseDown({ Hide-Overlay })
+$ovRoot.add_MouseDown({ Hide-Overlay })
+$ov.add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Escape') { $e.Handled = $true; $e.SuppressKeyPress = $true; Hide-Overlay } })
+# closing either window some other way (Alt+F4) only hides it
+foreach ($f in $ov, $ovDim) { $f.add_FormClosing({ param($s, $e) if (-not $script:reallyQuit -and $e.CloseReason -eq 'UserClosing') { $e.Cancel = $true; Hide-Overlay } }) }
+if ($script:OvOk) {
+    $script:Hotkey.add_Pressed({ try { Switch-Overlay } catch {} })
+    Set-OverlayHotkey
+    if ($Settings.rgb_sync) { Set-RgbSync $true }
+}
+$miOverlay = New-Object System.Windows.Forms.ToolStripMenuItem('Overlay')
+$miOverlay.add_Click({ Show-Overlay })
+$menu.Items.Insert(1, $miOverlay)
+
 # ---- events
 $btnToggle.add_Click({ if ($script:Job) { Stop-Presence } else { Start-Presence } })
 $btnRescan.add_Click({ Read-FromUi; Start-Scan })
@@ -2089,6 +2873,7 @@ $form.add_FormClosing({
     Stop-Presence
     if ($script:ScanJob) { Stop-Block $script:ScanJob $null 0 }
     $Sync.BridgeStop = $true; if ($script:BridgeJob) { Stop-Block $script:BridgeJob $null 2000 }
+    try { Hide-Overlay; if ($script:OvOk) { $script:Rgb.Stop(); $script:Obs.Stop(); $script:Hotkey.Dispose() } } catch {}
     $tray.Visible = $false; $tray.Dispose()
 })
 
