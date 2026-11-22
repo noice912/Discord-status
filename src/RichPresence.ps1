@@ -33,7 +33,7 @@ $DefaultAppId   = '1544831111128154213'   # "Playing" - current-app card
 # built-in apps that custom statuses can borrow when the user hasn't made their own Discord app (one card each)
 $CustomPoolIds  = @('1553178514365358100', '1553247468957990943')
 $RepoUrl      = 'https://github.com/noice912/Discord-status'
-$AppVersion   = '3.2.0'     # build.ps1 reads this; bump it for every release
+$AppVersion   = '3.2.1'     # build.ps1 reads this; bump it for every release
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
 # ===========================================================================
@@ -65,6 +65,9 @@ function New-DefaultSettings {
         custom_mode            = 'separate' # 'separate' = one card each, 'merge' = the ticked ones become one card
         overlay_enabled        = $true      # the panel over the game
         overlay_hotkey         = 'Ctrl+Alt+G'
+        overlay_controller     = $true      # ...and with the Xbox / PS button on a controller
+        gamebar_button_off     = $false     # stop Windows opening Xbox Game Bar on that button (a Windows setting, put back when unticked)
+        gamebar_button_before  = ''         # what that Windows setting was before we changed it ('' = we haven't)
         rgb_sync               = $false     # lights follow the screen (through OpenRGB)
         rgb_brightness         = 100
     }
@@ -1472,6 +1475,7 @@ $content.BringToFront()
 
 function New-Page { New-Ctl System.Windows.Forms.Panel $content @{ Dock = 'Fill'; BackColor = $cBg; Visible = $false; Padding = (New-Object System.Windows.Forms.Padding(20)) } }
 $pGames = New-Page; $pMusic = New-Page; $pCustom = New-Page; $pSettings = New-Page; $pLog = New-Page
+$pSettings.AutoScroll = $true      # the list is longer than the smallest window
 $pages = @{ 'Games' = $pGames; 'Music & Apps' = $pMusic; 'Custom status' = $pCustom; 'Settings' = $pSettings; 'Log' = $pLog }
 function Show-Page($name) {
     foreach ($k in $pages.Keys) {
@@ -1586,6 +1590,11 @@ $linkGuide = New-Ctl System.Windows.Forms.LinkLabel $pSettings @{ Text = 'Help &
 $chkOverlay = New-Check $pSettings 'Open the overlay over my game with this shortcut:' 512
 $txtHotkey = New-Ctl System.Windows.Forms.TextBox $pSettings @{ Location = (Pt 356 510); Size = (Sz 130 24); BackColor = $cCard; ForeColor = $cText; BorderStyle = 'FixedSingle' }
 $hotkeyHint = New-Ctl System.Windows.Forms.Label $pSettings @{ Text = 'Music, volume, games, OBS, lights and Discord. Shows over borderless and windowed games.'; ForeColor = $cDim; Font = $fSmall; Location = (Pt 42 536); AutoSize = $true }
+$chkPad = New-Check $pSettings 'Also open it with the Xbox or PS button on my controller' 558
+$chkGameBar = New-Check $pSettings 'Stop that button opening Xbox Game Bar (changes the Windows setting; untick to put it back)' 584
+$chkGameBar.Left = 44
+$padHint = New-Ctl System.Windows.Forms.Label $pSettings @{ Text = 'Steam has its own switch: Steam > Settings > Controller > turn off "Guide button focuses Steam".'; UseMnemonic = $false; ForeColor = $cDim; Font = $fSmall; Location = (Pt 62 608); AutoSize = $true }
+$chkPad.add_CheckedChanged({ $chkGameBar.Enabled = $chkPad.Checked })
 
 # ---- Log page
 $log = New-Ctl System.Windows.Forms.TextBox $pLog @{ Dock = 'Fill'; Multiline = $true; ReadOnly = $true; ScrollBars = 'Vertical'; BackColor = $cCard; ForeColor = $cText; BorderStyle = 'None'; Font = (New-Object System.Drawing.Font('Consolas', 9)) }
@@ -1605,6 +1614,7 @@ function Apply-ToUi {
     $chkOfficial.Checked = [bool]$Settings.official_to_discord
     $chkUpdate.Checked = [bool]$Settings.auto_update
     $chkOverlay.Checked = [bool]$Settings.overlay_enabled; $txtHotkey.Text = "$($Settings.overlay_hotkey)"
+    $chkPad.Checked = [bool]$Settings.overlay_controller; $chkGameBar.Checked = [bool]$Settings.gamebar_button_off; $chkGameBar.Enabled = $chkPad.Checked
 }
 function Read-FromUi {
     $Settings.genshin_uid = $txtUid.Text.Trim()
@@ -1619,10 +1629,12 @@ function Read-FromUi {
     $Settings.official_to_discord = $chkOfficial.Checked
     $Settings.auto_update = $chkUpdate.Checked
     $Settings.overlay_enabled = $chkOverlay.Checked
+    $Settings.overlay_controller = $chkPad.Checked; $Settings.gamebar_button_off = $chkGameBar.Checked
     # a shortcut that can't be used is put back to the last good one
     if (ConvertTo-Hotkey $txtHotkey.Text) { $Settings.overlay_hotkey = $txtHotkey.Text.Trim() } else { $txtHotkey.Text = "$($Settings.overlay_hotkey)" }
     Save-Settings $Settings
     Set-OverlayHotkey
+    Set-OverlayController
 }
 function Append-Log($line) {
     $log.AppendText($line + [Environment]::NewLine)
@@ -1962,6 +1974,117 @@ public class RPHotkey : NativeWindow, IDisposable {
 public static class RPKeys {
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     public static void Tap(byte vk) { keybd_event(vk, 0, 1, UIntPtr.Zero); keybd_event(vk, 0, 3, UIntPtr.Zero); }
+}
+
+// The logo button on a controller: the Xbox button (read through XInput) and the PS button on a
+// DualSense or DualShock 4 (read from the controller's own reports). Works while a game has the keyboard.
+public class RPPad : NativeWindow, IDisposable {
+    [StructLayout(LayoutKind.Sequential)] struct XState { public uint Packet; public ushort Buttons; public byte LT, RT; public short LX, LY, RX, RY; }
+    [DllImport("xinput1_4.dll", EntryPoint = "#100")] static extern int XInputGetStateEx(int index, out XState state);
+    [StructLayout(LayoutKind.Sequential)] struct RawDevice { public ushort UsagePage, Usage; public uint Flags; public IntPtr Target; }
+    [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RawDevice[] devs, uint count, uint size);
+    [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr input, uint cmd, IntPtr data, ref uint size, uint headerSize);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint GetRawInputDeviceInfo(IntPtr dev, uint cmd, StringBuilder data, ref uint size);
+
+    public event EventHandler Pressed;
+    public int Presses;                                     // how many times a logo button went down
+    public string Seen = "";                                // the PlayStation controllers that have sent anything
+    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+    readonly bool[] xDown = new bool[4];
+    readonly int[] xSkip = new int[4];
+    bool xinput = true, on;
+    readonly Dictionary<IntPtr, int> kinds = new Dictionary<IntPtr, int>();     // 0 = not ours, 1 = DualSense, 2 = DualShock 4
+    readonly Dictionary<IntPtr, bool> psDown = new Dictionary<IntPtr, bool>();
+
+    public RPPad() {
+        CreateHandle(new CreateParams());
+        timer.Interval = 50;
+        timer.Tick += delegate { Poll(); };
+    }
+    public void Enable(bool want) {
+        if (want == on) return;
+        on = want;
+        // gamepads and joysticks; 0x100 = keep sending while another window is in front, 1 = stop
+        RawDevice[] d = new RawDevice[2];
+        for (int i = 0; i < 2; i++) { d[i].UsagePage = 1; d[i].Usage = (ushort)(i == 0 ? 5 : 4); d[i].Flags = want ? 0x100u : 1u; d[i].Target = want ? Handle : IntPtr.Zero; }
+        RegisterRawInputDevices(d, 2, (uint)Marshal.SizeOf(typeof(RawDevice)));
+        if (want) timer.Start(); else timer.Stop();
+    }
+    void Fire() { Presses++; if (Pressed != null) Pressed(this, EventArgs.Empty); }
+
+    void Poll() {
+        if (!xinput) return;
+        for (int i = 0; i < 4; i++) {
+            if (xSkip[i] > 0) { xSkip[i]--; continue; }     // an empty slot is slow to ask: look again in 2 seconds
+            XState s; int r;
+            try { r = XInputGetStateEx(i, out s); } catch { xinput = false; return; }
+            if (r != 0) { xSkip[i] = 40; xDown[i] = false; continue; }
+            bool down = (s.Buttons & 0x0400) != 0;
+            if (down && !xDown[i]) Fire();
+            xDown[i] = down;
+        }
+    }
+
+    int Kind(IntPtr dev) {
+        int k;
+        if (kinds.TryGetValue(dev, out k)) return k;
+        k = 0;
+        try {
+            uint n = 0; GetRawInputDeviceInfo(dev, 0x20000007, null, ref n);
+            StringBuilder sb = new StringBuilder((int)n + 2);
+            GetRawInputDeviceInfo(dev, 0x20000007, sb, ref n);
+            Match m = Regex.Match(sb.ToString(), "054c.{0,4}pid[_&]([0-9a-f]{4})", RegexOptions.IgnoreCase);
+            if (m.Success) {
+                string pid = m.Groups[1].Value.ToLowerInvariant();
+                if (pid == "0ce6" || pid == "0df2") k = 1;
+                else if (pid == "05c4" || pid == "09cc" || pid == "0ba0") k = 2;
+                if (k != 0) Seen = (Seen + " " + (k == 1 ? "DualSense" : "DualShock 4")).Trim();
+            }
+        } catch { }
+        kinds[dev] = k;
+        return k;
+    }
+    // where the PS button is in a report; -1 = this report doesn't carry it
+    public static int PsByte(int kind, int reportId, int size) {
+        if (kind == 1) {
+            if (reportId == 0x31) return 11;                // Bluetooth, full report
+            if (reportId == 0x01) return size >= 64 ? 10 : 7;   // USB : Bluetooth, short report
+        } else if (kind == 2) {
+            if (reportId == 0x11) return 9;                 // Bluetooth
+            if (reportId == 0x01) return 7;                 // USB
+        }
+        return -1;
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == 0x00FF && on) {
+            try {
+                uint header = (uint)(8 + 2 * IntPtr.Size), size = 0;
+                GetRawInputData(m.LParam, 0x10000003, IntPtr.Zero, ref size, header);
+                if (size > header + 8 && size < 4096) {
+                    IntPtr buf = Marshal.AllocHGlobal((int)size);
+                    try {
+                        if (GetRawInputData(m.LParam, 0x10000003, buf, ref size, header) == size && Marshal.ReadInt32(buf) == 2) {
+                            IntPtr dev = Marshal.ReadIntPtr(buf, 8);
+                            int kind = Kind(dev);
+                            int each = Marshal.ReadInt32(buf, (int)header), count = Marshal.ReadInt32(buf, (int)header + 4);
+                            if (kind != 0 && each > 0 && count > 0 && header + 8 + each <= size) {
+                                int at = (int)header + 8;
+                                int idx = PsByte(kind, Marshal.ReadByte(buf, at), each);
+                                if (idx >= 0 && idx < each) {
+                                    bool down = (Marshal.ReadByte(buf, at + idx) & 1) != 0, was;
+                                    psDown.TryGetValue(dev, out was);
+                                    if (down && !was) Fire();
+                                    psDown[dev] = down;
+                                }
+                            }
+                        }
+                    } finally { Marshal.FreeHGlobal(buf); }
+                }
+            } catch { }
+        }
+        base.WndProc(ref m);
+    }
+    public void Dispose() { try { Enable(false); } catch { } timer.Dispose(); DestroyHandle(); }
 }
 
 // ------------------------------------------------------------------ volume: the PC's and each app's
@@ -2362,10 +2485,10 @@ public class RPObs {
 }
 '@
 
-$script:Hotkey = $null; $script:Rgb = $null; $script:Obs = $null; $script:OvOk = $false
+$script:Hotkey = $null; $script:Pad = $null; $script:Rgb = $null; $script:Obs = $null; $script:OvOk = $false
 try {
     if (-not ('RPHotkey' -as [type])) { Add-Type -TypeDefinition $OverlayCode -ReferencedAssemblies System.Windows.Forms, System.Drawing }
-    $script:Hotkey = New-Object RPHotkey; $script:Rgb = New-Object RPRgb; $script:Obs = New-Object RPObs
+    $script:Hotkey = New-Object RPHotkey; $script:Pad = New-Object RPPad; $script:Rgb = New-Object RPRgb; $script:Obs = New-Object RPObs
     $script:OvOk = $true
 } catch { Append-Log ("[{0}] The overlay couldn't be set up: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message) }
 
@@ -2397,6 +2520,32 @@ function Set-OverlayHotkey {
     if (-not $hk -or -not $script:Hotkey.Set([uint32]$hk.Mods, [uint32]$hk.Vk)) {
         Append-Log ("[{0}] The overlay shortcut {1} couldn't be used (another program has it?). Pick another under Settings." -f (Get-Date -Format 'HH:mm:ss'), $want)
     }
+}
+
+# The controller's logo button. Windows gives that button to Xbox Game Bar unless its own switch
+# (Settings > Gaming > Game Bar > "open Game Bar using this button") is off; that switch is this registry value.
+$GameBarKey = 'HKCU:\Software\Microsoft\GameBar'
+function Set-GameBarButton {
+    try {
+        $now = (Get-ItemProperty -Path $GameBarKey -Name UseNexusForGameBarEnabled -ErrorAction SilentlyContinue).UseNexusForGameBarEnabled
+        if ($Settings.overlay_enabled -and $Settings.overlay_controller -and $Settings.gamebar_button_off) {
+            if ("$($Settings.gamebar_button_before)" -eq '') { $Settings.gamebar_button_before = $(if ($null -eq $now) { 'unset' } else { "$now" }); Save-Settings $Settings }
+            if ($now -ne 0) {
+                if (-not (Test-Path $GameBarKey)) { New-Item -Path $GameBarKey -Force | Out-Null }
+                Set-ItemProperty -Path $GameBarKey -Name UseNexusForGameBarEnabled -Value 0 -Type DWord
+            }
+        } elseif ("$($Settings.gamebar_button_before)" -ne '') {
+            # put Windows back the way it was
+            if ($Settings.gamebar_button_before -eq 'unset') { Remove-ItemProperty -Path $GameBarKey -Name UseNexusForGameBarEnabled -ErrorAction SilentlyContinue }
+            else { Set-ItemProperty -Path $GameBarKey -Name UseNexusForGameBarEnabled -Value ([int]$Settings.gamebar_button_before) -Type DWord }
+            $Settings.gamebar_button_before = ''; Save-Settings $Settings
+        }
+    } catch { Append-Log ("[{0}] Couldn't change the Game Bar button setting: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message) }
+}
+function Set-OverlayController {
+    if (-not $script:OvOk) { return }
+    $script:Pad.Enable([bool]($Settings.overlay_enabled -and $Settings.overlay_controller))
+    Set-GameBarButton
 }
 
 $cKey = C '#010201'
@@ -2652,7 +2801,7 @@ function Show-Overlay {
     $b = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).Bounds
     $ovDim.Bounds = $b; $ov.Bounds = $b
     $ovRoot.Location = Pt ([math]::Max(0, [int](($b.Width - $ovRoot.Width) / 2))) ([math]::Max(0, [int](($b.Height - $ovRoot.Height) / 2)))
-    $ovHint.Text = "$($Settings.overlay_hotkey) or Esc to close"
+    $ovHint.Text = "$($Settings.overlay_hotkey)$(if ($Settings.overlay_controller) { ', the controller''s logo button' }) or Esc to close"
     $ovSearch.Text = ''
     # the custom statuses, as the Custom status page has them
     $script:OvLoading = $true
@@ -2682,7 +2831,9 @@ $ov.add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Escape') { $e.Handled = $tru
 foreach ($f in $ov, $ovDim) { $f.add_FormClosing({ param($s, $e) if (-not $script:reallyQuit -and $e.CloseReason -eq 'UserClosing') { $e.Cancel = $true; Hide-Overlay } }) }
 if ($script:OvOk) {
     $script:Hotkey.add_Pressed({ try { Switch-Overlay } catch {} })
+    $script:Pad.add_Pressed({ try { Switch-Overlay } catch {} })
     Set-OverlayHotkey
+    Set-OverlayController
     if ($Settings.rgb_sync) { Set-RgbSync $true }
 }
 $miOverlay = New-Object System.Windows.Forms.ToolStripMenuItem('Overlay')
@@ -2873,7 +3024,7 @@ $form.add_FormClosing({
     Stop-Presence
     if ($script:ScanJob) { Stop-Block $script:ScanJob $null 0 }
     $Sync.BridgeStop = $true; if ($script:BridgeJob) { Stop-Block $script:BridgeJob $null 2000 }
-    try { Hide-Overlay; if ($script:OvOk) { $script:Rgb.Stop(); $script:Obs.Stop(); $script:Hotkey.Dispose() } } catch {}
+    try { Hide-Overlay; if ($script:OvOk) { $script:Rgb.Stop(); $script:Obs.Stop(); $script:Hotkey.Dispose(); $script:Pad.Dispose() } } catch {}
     $tray.Visible = $false; $tray.Dispose()
 })
 

@@ -1,3 +1,20 @@
+## RichPresence 3.2.1
+
+### Open the overlay from your controller (Windows)
+The **Xbox button**, or the **PS button** on a DualSense or DualShock 4, now opens and closes the overlay.
+It's on by default; turn it off at the bottom of **Settings**.
+
+Two other programs want that button too:
+- **Xbox Game Bar**: tick **Stop that button opening Xbox Game Bar** in Settings. It turns off the Windows
+  switch for it and puts it back when you untick.
+- **Steam**: in Steam, go to **Settings > Controller** and turn off **Guide button focuses Steam**.
+  RichPresence can't change that one for you.
+
+The overlay itself still needs a mouse. Seeing the controller was checked with a DualSense; an actual button
+press and the Game Bar switch were **not yet tried**. If one misbehaves, please open an issue.
+
+Linux, Android and iPhone: no changes, only the version number.
+
 ## RichPresence 3.2.0
 
 ### In-game overlay (Windows)

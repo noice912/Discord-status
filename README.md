@@ -74,7 +74,7 @@ Your settings are stored in `%APPDATA%\RichPresence`. Delete that folder to rese
 
 ## In-game overlay (Windows)
 
-Press **Ctrl+Alt+G** while you play and a panel opens over the game. Press it again, press Esc or click outside to close it.
+Press **Ctrl+Alt+G**, or the **Xbox / PS button** on your controller, while you play and a panel opens over the game. Press it again, press Esc or click outside to close it.
 
 | Part | What it does |
 |---|---|
@@ -87,6 +87,8 @@ Press **Ctrl+Alt+G** while you play and a panel opens over the game. Press it ag
 | **Discord** | Presence on or off, and your custom statuses. |
 
 It shows over borderless and windowed games, which is most games today, but not over true exclusive fullscreen: nothing is put inside the game, so anti-cheat has nothing to object to. Change or turn off the shortcut at the bottom of **Settings**.
+
+If the controller button opens something else instead: tick **Stop that button opening Xbox Game Bar** in Settings (it turns off the Windows switch and puts it back when you untick), and in Steam turn off **Settings > Controller > Guide button focuses Steam**.
 
 ## Custom status (Windows)
 
@@ -172,7 +174,7 @@ Discord shows one activity per Discord application, so each card uses its own ap
 Small unsigned tools that watch running programs and talk to Discord sometimes get flagged by heuristic scanners. This one isn't malware, and you don't have to take that on faith:
 
 - **The whole program is one readable file:** [`src/RichPresence.ps1`](src/RichPresence.ps1). The EXE is that script wrapped by [PS2EXE](https://github.com/MScholtes/PS2EXE), and PS2EXE-built files are a common false-positive target.
-- **What it does:** list running process names, read the focused window's title and your browsers' window titles, read the "now playing" info Windows shows in its media controls (Apple Music, Spotify, and videos in browsers), and talk to the Discord app on your PC over its local pipe. The overlay adds a global keyboard shortcut, media keys, app volume, and (only if you turn the light sync on) the average colour of the screen. To control OBS it reads the port and password OBS keeps in its own settings folder; they are used only to talk to OBS on your PC and are never stored or sent anywhere.
+- **What it does:** list running process names, read the focused window's title and your browsers' window titles, read the "now playing" info Windows shows in its media controls (Apple Music, Spotify, and videos in browsers), and talk to the Discord app on your PC over its local pipe. The overlay adds a global keyboard shortcut, the logo button on a controller, media keys, app volume, and (only if you turn the light sync on) the average colour of the screen. To control OBS it reads the port and password OBS keeps in its own settings folder; they are used only to talk to OBS on your PC and are never stored or sent anywhere.
 - **What it never does:** inject code, read or write game memory, modify game files, log keystrokes, or ask for passwords/tokens.
 - **Network calls:** `discord.com` (the public list of known games), `enka.network` (Genshin profile, optional), `itunes.apple.com` (album art), `lrclib.net` (lyrics), `google.com/s2/favicons` (app and streaming-service icons), `api.tvmaze.com` and `v3-cinemeta.strem.io` (show and movie posters, optional). Nothing is sent to the author.
 - **Verify or build it yourself:** releases are built by GitHub Actions from this repo, so you can [build it yourself](#build-it-yourself) and compare. You can also upload the EXE to [VirusTotal](https://www.virustotal.com) and see that the few flags, if any, are generic heuristics from PS2EXE.
