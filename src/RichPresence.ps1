@@ -33,7 +33,7 @@ $DefaultAppId   = '1544831111128154213'   # "Playing" - current-app card
 # built-in apps that custom statuses can borrow when the user hasn't made their own Discord app (one card each)
 $CustomPoolIds  = @('1553178514365358100', '1553247468957990943')
 $RepoUrl      = 'https://github.com/noice912/Discord-status'
-$AppVersion   = '3.3.2'     # build.ps1 reads this; bump it for every release
+$AppVersion   = '3.3.3'     # build.ps1 reads this; bump it for every release
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
 # ===========================================================================
@@ -71,6 +71,8 @@ function New-DefaultSettings {
         pause_remote_play      = $false     # pause PS Remote Play while the overlay is open, so the PlayStation doesn't get the controller
         rgb_sync               = $false     # lights follow the screen (through OpenRGB)
         rgb_brightness         = 100
+        rgb_source             = ''         # '' = the screen; otherwise the id of a capture card the lights follow
+        rgb_source_name        = ''
     }
 }
 function Load-Settings {
@@ -1314,7 +1316,7 @@ function New-Sync {
     [hashtable]::Synchronized(@{
         Stop = $false; Queue = (New-Object System.Collections.Concurrent.ConcurrentQueue[string])
         Status = 'Stopped'; Games = @(); RunningIds = @(); WatchId = $null; GameExited = $false; ScanDone = $false; AppLabel = ''
-        Now = $null; UpdateState = ''; UpdateFile = $null; UpdateHash = ''; LatestVersion = ''; Custom = @{ Mode = 'separate'; Items = @() }
+        Now = $null; CapGen = 0; CapStatus = ''; CapSize = ''; CapFormats = ''; UpdateState = ''; UpdateFile = $null; UpdateHash = ''; LatestVersion = ''; Custom = @{ Mode = 'separate'; Items = @() }
         Ext = [hashtable]::Synchronized(@{}); BridgeStop = $false     # what the browser extension reports: service -> (tab -> report)
     })
 }
@@ -2463,6 +2465,7 @@ public class RPRgb {
     public volatile string Status = "Off";
     public volatile int Color = 0;              // 0xRRGGBB last sent
     public volatile int Brightness = 100;       // percent
+    public volatile int Source = -1;            // 0xRRGGBB from somewhere else (a capture card); -1 = use the screen
     public volatile int Devices = 0;
     volatile bool stop = true;
     volatile int gen = 0;                       // each Start gets its own number, so an old thread can tell it was replaced
@@ -2544,6 +2547,21 @@ public class RPRgb {
         return leds;
     }
 
+    // the colour of a picture (BGRA bytes): a grid of samples, colourful ones counting more than grey ones
+    public static int Average(byte[] bgra, int width, int height) {
+        if (bgra == null || width <= 0 || height <= 0 || bgra.Length < 4 * width * height) return 0;
+        long r = 0, g = 0, b = 0, w = 0;
+        int stepX = Math.Max(1, width / 48), stepY = Math.Max(1, height / 27);
+        for (int y = stepY / 2; y < height; y += stepY) for (int x = stepX / 2; x < width; x += stepX) {
+            int i = 4 * (y * width + x);
+            int cb = bgra[i], cg = bgra[i + 1], cr = bgra[i + 2];
+            int max = Math.Max(cr, Math.Max(cg, cb)), min = Math.Min(cr, Math.Min(cg, cb));
+            int wt = 1 + (max - min);
+            r += cr * wt; g += cg * wt; b += cb * wt; w += wt;
+        }
+        if (w == 0) return 0;
+        return ((int)(r / w) << 16) | ((int)(g / w) << 8) | (int)(b / w);
+    }
     int ScreenColor(Bitmap bmp) {
         int sw = GetSystemMetrics(0), sh = GetSystemMetrics(1);
         using (Graphics g = Graphics.FromImage(bmp)) {
@@ -2577,7 +2595,8 @@ public class RPRgb {
                         Status = leds.Length == 0 ? "OpenRGB found no lights" : "Syncing " + leds.Length + (leds.Length == 1 ? " device" : " devices");
                         int last = -1; DateTime sent = DateTime.MinValue;
                         while (Live(g)) {
-                            int col = ScreenColor(bmp);
+                            int src = Source;
+                            int col = src >= 0 ? src : ScreenColor(bmp);
                             double k = Brightness / 100.0;
                             cr += (((col >> 16) & 255) * k - cr) * 0.35; cg += (((col >> 8) & 255) * k - cg) * 0.35; cb += ((col & 255) * k - cb) * 0.35;
                             int now = ((int)cr << 16) | ((int)cg << 8) | (int)cb;
@@ -2942,17 +2961,154 @@ function Start-OvObs {
 
 # ---- lights
 $ovRgb = New-OvWidget 'Lights' 396 580 380 120
-$ovRgbOn = New-Ctl System.Windows.Forms.CheckBox $ovRgb @{ Text = 'Match my lights to the screen'; Location = (Pt 13 34); AutoSize = $true }
+$ovRgbOn = New-Ctl System.Windows.Forms.CheckBox $ovRgb @{ Text = 'Match my lights to'; Location = (Pt 13 34); AutoSize = $true }
+$ovRgbFrom = New-Ctl System.Windows.Forms.ComboBox $ovRgb @{ DropDownStyle = 'DropDownList'; FlatStyle = 'Flat'; Location = (Pt 150 31); Size = (Sz 172 24); BackColor = $cCardHi; ForeColor = $cText }
 $ovRgbSwatch = New-Ctl System.Windows.Forms.Panel $ovRgb @{ Location = (Pt 332 32); Size = (Sz 36 22); BackColor = $cCardHi }
 [void](New-Ctl System.Windows.Forms.Label $ovRgb @{ Text = 'Brightness'; ForeColor = $cDim; Location = (Pt 13 66); AutoSize = $true })
 $ovRgbBright = New-Ctl System.Windows.Forms.TrackBar $ovRgb @{ AutoSize = $false; Location = (Pt 90 60); Size = (Sz 278 30); Minimum = 10; Maximum = 100; TickStyle = 'None'; BackColor = $cCard }
-$ovRgbStatus = New-Ctl System.Windows.Forms.Label $ovRgb @{ Text = ''; UseMnemonic = $false; ForeColor = $cDim; Font = $fSmall; Location = (Pt 13 94); Size = (Sz 356 18) }
+$ovRgbStatus = New-Ctl System.Windows.Forms.Label $ovRgb @{ Text = ''; UseMnemonic = $false; ForeColor = $cDim; Font = $fSmall; Location = (Pt 13 94); Size = (Sz 356 18); AutoEllipsis = $true }
+
+# ---- lights can follow a capture card instead of the screen (a console plugged into an HDMI capture card).
+# Runs on its own runspace: opens the device through Windows' camera interface, takes the newest frame a few
+# times a second, and hands its colour to the lights. $Gen is this run's number; a newer one ends it.
+$CaptureWorker = {
+    param($Sync, $DeviceId, $Rgb, $Gen)
+    $ErrorActionPreference = 'Stop'
+    $cap = $null; $reader = $null
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+        $ext = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }
+        $asOp  = ($ext | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+        $asAct = ($ext | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+        function Await($op, $type) { $t = $asOp.MakeGenericMethod($type).Invoke($null, @($op)); if (-not $t.Wait(10000)) { throw 'the device didn''t answer in time' }; $t.Result }
+        function AwaitAction($op) { $t = $asAct.Invoke($null, @($op)); if (-not $t.Wait(10000)) { throw 'the device didn''t answer in time' } }
+        [Windows.Media.Capture.MediaCapture, Windows.Media.Capture, ContentType = WindowsRuntime] | Out-Null
+        [Windows.Media.Capture.Frames.MediaFrameSourceGroup, Windows.Media.Capture, ContentType = WindowsRuntime] | Out-Null
+        [Windows.Media.MediaProperties.MediaEncodingSubtypes, Windows.Media.MediaProperties, ContentType = WindowsRuntime] | Out-Null
+        [Windows.Storage.Streams.Buffer, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
+        [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType = WindowsRuntime] | Out-Null
+
+        $groups = Await ([Windows.Media.Capture.Frames.MediaFrameSourceGroup]::FindAllAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Media.Capture.Frames.MediaFrameSourceGroup]])
+        $group = $null; $info = $null
+        foreach ($g in $groups) {
+            foreach ($si in $g.SourceInfos) {
+                if ("$($si.SourceKind)" -eq 'Color' -and ("$($g.Id)" -eq $DeviceId -or "$($si.DeviceInformation.Id)" -eq $DeviceId)) { $group = $g; $info = $si; break }
+            }
+            if ($group) { break }
+        }
+        if (-not $group) { throw 'that capture device isn''t plugged in' }
+
+        # shared first, so a program that is already showing the picture can keep it; on its own if that is refused
+        foreach ($mode in 'SharedReadOnly', 'ExclusiveControl') {
+            $set = New-Object Windows.Media.Capture.MediaCaptureInitializationSettings
+            $set.SourceGroup = $group
+            $set.SharingMode = [Windows.Media.Capture.MediaCaptureSharingMode]$mode
+            $set.MemoryPreference = [Windows.Media.Capture.MediaCaptureMemoryPreference]::Cpu
+            $set.StreamingCaptureMode = [Windows.Media.Capture.StreamingCaptureMode]::Video
+            $cap = New-Object Windows.Media.Capture.MediaCapture
+            try { AwaitAction ($cap.InitializeAsync($set)); break }
+            catch { try { $cap.Dispose() } catch {}; $cap = $null; if ($mode -eq 'ExclusiveControl') { throw 'another program is using it, or camera access is off in Windows'' privacy settings' } }
+        }
+        $src = $null
+        foreach ($pair in $cap.FrameSources) { $s = $pair.Value; if ($s -and "$($s.Info.SourceKind)" -eq 'Color' -and (-not $src -or "$($s.Info.Id)" -eq "$($info.Id)")) { $src = $s } }
+        if (-not $src) { throw 'the device has no picture stream' }
+        # The smallest uncompressed picture it offers is plenty for one colour. (Compressed ones - MJPG, H264 -
+        # can't be turned into plain pixels here; and when sharing the device the size can't be changed at all.)
+        $plain = @($src.SupportedFormats | Where-Object { "$($_.Subtype)" -match '^(YUY2|NV12|UYVY|RGB24|RGB32|ARGB32|I420|IYUV|YV12)$' })
+        $Sync.CapFormats = (@($src.SupportedFormats | ForEach-Object { "$($_.Subtype) $($_.VideoFormat.Width)x$($_.VideoFormat.Height)" } | Select-Object -Unique) -join ', ')
+        try {
+            $small = @($plain | Where-Object { $_.VideoFormat.Width -ge 320 } | Sort-Object { [int]$_.VideoFormat.Width * [int]$_.VideoFormat.Height } | Select-Object -First 1)
+            if ($small.Count) { AwaitAction ($src.SetFormatAsync($small[0])) }
+        } catch {}
+        $reader = Await ($cap.CreateFrameReaderAsync($src, [Windows.Media.MediaProperties.MediaEncodingSubtypes]::Bgra8)) ([Windows.Media.Capture.Frames.MediaFrameReader])
+        $started = Await ($reader.StartAsync()) ([Windows.Media.Capture.Frames.MediaFrameReaderStartStatus])
+        if ("$started" -ne 'Success') {
+            if (-not $plain.Count) { throw 'it only sends compressed video, which can''t be read for colours' }
+            throw "the picture didn't start ($started; it is set to $($src.CurrentFormat.Subtype) $($src.CurrentFormat.VideoFormat.Width)x$($src.CurrentFormat.VideoFormat.Height))"
+        }
+
+        $Sync.CapStatus = 'ok'
+        $buf = $null; $last = [datetime]::UtcNow
+        while ($Sync.CapGen -eq $Gen) {
+            $frame = $reader.TryAcquireLatestFrame()
+            if ($frame) {
+                try {
+                    $bmp = $frame.VideoMediaFrame.SoftwareBitmap
+                    if ($bmp) {
+                        $w = [int]$bmp.PixelWidth; $h = [int]$bmp.PixelHeight; $need = 4 * $w * $h
+                        if (-not $buf -or $buf.Capacity -ne $need) { $buf = New-Object Windows.Storage.Streams.Buffer($need) }
+                        $bmp.CopyToBuffer($buf)
+                        $bytes = [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions]::ToArray($buf)
+                        $Rgb.Source = [RPRgb]::Average($bytes, $w, $h)
+                        $Sync.CapSize = "${w}x$h"; $last = [datetime]::UtcNow
+                        $bmp.Dispose()
+                    }
+                } finally { $frame.Dispose() }
+            } elseif (([datetime]::UtcNow - $last).TotalSeconds -gt 5) { $Sync.CapStatus = 'no picture is coming from it'; $last = [datetime]::UtcNow.AddSeconds(3600) }
+            Start-Sleep -Milliseconds 70
+        }
+    } catch {
+        $m = $_.Exception; while ($m.InnerException) { $m = $m.InnerException }
+        if ($Sync.CapGen -eq $Gen) { $Sync.CapStatus = "$($m.Message)" }
+    } finally {
+        if ($Sync.CapGen -eq $Gen) { $Rgb.Source = -1 }
+        try { if ($reader) { $reader.Dispose() } } catch {}
+        try { if ($cap) { $cap.Dispose() } } catch {}
+    }
+}
+
+# the capture cards and cameras Windows knows about: @{ Id; Name }
+function Get-CaptureDevices {
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+        $asOp = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+        [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType = WindowsRuntime] | Out-Null
+        $t = $asOp.MakeGenericMethod([Windows.Devices.Enumeration.DeviceInformationCollection]).Invoke($null, @([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync([Windows.Devices.Enumeration.DeviceClass]::VideoCapture)))
+        if (-not $t.Wait(4000)) { return @() }
+        @($t.Result | ForEach-Object { @{ Id = "$($_.Id)"; Name = "$($_.Name)" } })
+    } catch { @() }
+}
+$script:CapJob = $null; $script:CapDevices = @()
+function Stop-Capture {
+    $Sync.CapGen = [int]$Sync.CapGen + 1       # the running one sees a newer number and ends
+    if ($script:CapJob) { Stop-Block $script:CapJob $null 0; $script:CapJob = $null }
+    if ($script:OvOk) { $script:Rgb.Source = -1 }
+    $Sync.CapStatus = ''
+}
+function Start-Capture {
+    Stop-Capture
+    if (-not $script:OvOk -or -not $Settings.rgb_source) { return }
+    $Sync.CapStatus = 'starting'
+    $script:CapJob = Start-Block $CaptureWorker @($Sync, "$($Settings.rgb_source)", $script:Rgb, [int]$Sync.CapGen)
+}
 function Set-RgbSync($on) {
     if (-not $script:OvOk) { return }
     $script:Rgb.Brightness = [int]$Settings.rgb_brightness
-    if ($on) { $script:Rgb.Start('127.0.0.1', 6742) } else { $script:Rgb.Stop() }
+    if ($on) { $script:Rgb.Start('127.0.0.1', 6742); if ($Settings.rgb_source) { Start-Capture } else { Stop-Capture } }
+    else { Stop-Capture; $script:Rgb.Stop() }
+}
+# the list: the screen, then every capture device; the saved one stays in it even when it is unplugged
+function Update-RgbSources {
+    $script:CapDevices = @(Get-CaptureDevices)
+    if ($Settings.rgb_source -and -not @($script:CapDevices | Where-Object { $_.Id -eq "$($Settings.rgb_source)" }).Count) {
+        $script:CapDevices += @{ Id = "$($Settings.rgb_source)"; Name = "$(if ($Settings.rgb_source_name) { $Settings.rgb_source_name } else { 'capture card' }) (not plugged in)" }
+    }
+    $script:OvLoading = $true
+    $ovRgbFrom.Items.Clear(); [void]$ovRgbFrom.Items.Add('the screen')
+    $pick = 0
+    for ($i = 0; $i -lt $script:CapDevices.Count; $i++) { [void]$ovRgbFrom.Items.Add("$($script:CapDevices[$i].Name)"); if ($script:CapDevices[$i].Id -eq "$($Settings.rgb_source)") { $pick = $i + 1 } }
+    $ovRgbFrom.SelectedIndex = $pick
+    $script:OvLoading = $false
 }
 $ovRgbOn.add_Click({ $Settings.rgb_sync = $ovRgbOn.Checked; Save-Settings $Settings; Set-RgbSync $ovRgbOn.Checked })
+$ovRgbFrom.add_SelectedIndexChanged({
+    if ($script:OvLoading) { return }
+    $i = $ovRgbFrom.SelectedIndex
+    if ($i -le 0) { $Settings.rgb_source = ''; $Settings.rgb_source_name = '' }
+    else { $d = $script:CapDevices[$i - 1]; $Settings.rgb_source = "$($d.Id)"; $Settings.rgb_source_name = ("$($d.Name)" -replace ' \(not plugged in\)$', '') }
+    Save-Settings $Settings
+    if ($Settings.rgb_sync) { Set-RgbSync $true }
+})
 $ovRgbBright.add_Scroll({ Set-OvBar $ovRgbBright })
 $ovRgbBright.add_MouseUp({ Save-Settings $Settings })
 
@@ -3487,7 +3643,8 @@ function Update-Overlay {
             if (($names -join "`n") -ne (@($ovObsScene.Items) -join "`n")) { $ovObsScene.Items.Clear(); foreach ($n in $names) { [void]$ovObsScene.Items.Add($n) } }
             if ("$($ovObsScene.SelectedItem)" -ne "$($o.Scene)") { $ovObsScene.SelectedItem = "$($o.Scene)" }
         }
-        $ovRgbStatus.Text = $(if ($script:Rgb.Running) { "$($script:Rgb.Status)" } else { 'Needs OpenRGB open with its SDK server running.' })
+        $capNote = $(if (-not $Settings.rgb_source) { '' } elseif ($Sync.CapStatus -eq 'ok') { "  -  following $($Settings.rgb_source_name)" } elseif ($Sync.CapStatus -in '', 'starting') { "  -  opening $($Settings.rgb_source_name)..." } else { "  -  $($Settings.rgb_source_name): $($Sync.CapStatus); using the screen" })
+        $ovRgbStatus.Text = $(if ($script:Rgb.Running) { "$($script:Rgb.Status)$capNote" } else { 'Needs OpenRGB open with its SDK server running.' })
         $col = [int]$script:Rgb.Color
         $ovRgbSwatch.BackColor = $(if ($script:Rgb.Running) { [System.Drawing.Color]::FromArgb(255, ($col -shr 16) -band 255, ($col -shr 8) -band 255, $col -band 255) } else { $cCardHi })
     }
@@ -3513,6 +3670,7 @@ function Show-Overlay {
     for ($i = 0; $i -lt $lstC.Items.Count; $i++) { [void]$ovDList.Items.Add("$($lstC.Items[$i])", $lstC.GetItemChecked($i)) }
     $script:OvLoading = $false
     $ovRgbOn.Checked = [bool]$Settings.rgb_sync
+    Update-RgbSources
     $ovRgbBright.Value = [math]::Max(10, [math]::Min(100, [int]$Settings.rgb_brightness))
     Start-OvObs
     $script:OvTick = 0
@@ -3749,6 +3907,7 @@ $form.add_FormClosing({
     if ($script:ScanJob) { Stop-Block $script:ScanJob $null 0 }
     $Sync.BridgeStop = $true; if ($script:BridgeJob) { Stop-Block $script:BridgeJob $null 2000 }
     try { Resume-RemotePlay } catch {}       # never leave it paused
+    try { Stop-Capture } catch {}
     try { if ($script:Chat.View) { $script:Chat.View.Dispose() } } catch {}
     try { Hide-Overlay; if ($script:OvOk) { $script:Rgb.Stop(); $script:Obs.Stop(); $script:Hotkey.Dispose(); $script:Pad.Dispose() } } catch {}
     $tray.Visible = $false; $tray.Dispose()

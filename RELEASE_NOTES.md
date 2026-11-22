@@ -1,3 +1,22 @@
+## RichPresence 3.3.3
+
+### Lights can follow a capture card (Windows)
+The overlay's **Lights** box could match your lights to the screen. It can now match them to a capture card
+instead, so the room follows a console plugged into an HDMI capture card even when its picture isn't on
+your screen. Next to **Match my lights to**, pick **the screen** or your capture device.
+
+Good to know:
+- It works with capture cards and cameras that Windows lists as video devices and that can send plain
+  (uncompressed) video; most USB HDMI capture cards can.
+- If another program is already using the card, it may refuse to be shared. The box then says so and the
+  lights go back to following the screen.
+- It still needs [OpenRGB](https://openrgb.org) open with its SDK server running, and it is one colour for
+  every light.
+- Reading the card was checked with a USB HDMI capture card. The lights themselves following it has **not
+  been tried yet**; if they don't, please open an issue.
+
+Linux, Android and iPhone: no changes, only the version number.
+
 ## RichPresence 3.3.2
 
 ### PS Remote Play: keep the controller to the overlay (Windows)
