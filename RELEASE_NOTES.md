@@ -23,6 +23,9 @@ Good to know:
 - OBS control and the light sync were built against their documented interfaces but **not yet tried
   end to end**. If one misbehaves, please open an issue.
 
+### Linux, Android and iPhone
+No changes in this release; only the version number moves to 3.2.0 so every platform matches.
+
 ## RichPresence 2.1.6
 
 ### Spotify with live lyrics (Windows)
