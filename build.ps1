@@ -18,8 +18,19 @@ if (-not $ver) { throw 'AppVersion not found in src\RichPresence.ps1' }
 $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 
+# Discord in the overlay needs three Microsoft WebView2 files. build-chat.ps1 gets them (one fixed version
+# from nuget.org, checked against a checksum) and zips them; the zip then goes inside the EXE as text, so
+# the app is still a single file and never downloads them.
+& (Join-Path $root 'build-chat.ps1')
+$pack = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $dist 'RichPresence-chat.zip')))
+$text = Get-Content (Join-Path $root 'src\RichPresence.ps1') -Raw -Encoding UTF8
+if (-not $text.Contains("`$ChatPack = ''")) { throw 'ChatPack placeholder not found in src\RichPresence.ps1' }
+$script = Join-Path $dist 'RichPresence.build.ps1'
+[IO.File]::WriteAllText($script, $text.Replace("`$ChatPack = ''", "`$ChatPack = '$pack'"), (New-Object System.Text.UTF8Encoding($true)))
+Write-Host "WebView2 files packed into the EXE ($([math]::Round($pack.Length / 1KB)) KB of text)."
+
 Invoke-ps2exe `
-    -inputFile  (Join-Path $root 'src\RichPresence.ps1') `
+    -inputFile  $script `
     -outputFile (Join-Path $dist 'RichPresence.exe') `
     -iconFile   (Join-Path $root 'assets\icon.ico') `
     -noConsole -STA `

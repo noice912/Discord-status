@@ -33,7 +33,7 @@ $DefaultAppId   = '1544831111128154213'   # "Playing" - current-app card
 # built-in apps that custom statuses can borrow when the user hasn't made their own Discord app (one card each)
 $CustomPoolIds  = @('1553178514365358100', '1553247468957990943')
 $RepoUrl      = 'https://github.com/noice912/Discord-status'
-$AppVersion   = '3.2.2'     # build.ps1 reads this; bump it for every release
+$AppVersion   = '3.3.0'     # build.ps1 reads this; bump it for every release
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
 # ===========================================================================
@@ -2814,6 +2814,206 @@ function Update-OvGames {
 }
 $ovSearch.add_TextChanged({ Update-OvGames })
 
+# ---- Discord inside the overlay: Discord's own web app in a built-in browser (Microsoft's WebView2),
+# so it is the real thing - every chat, pins, groups, history and calls. You sign in on Discord's page;
+# RichPresence never sees the password. The sign-in stays in the browser's own profile folder.
+# Three small Microsoft files drive the browser. They travel inside the EXE ($ChatPack, a zip as text that
+# build.ps1 fills in) and are unpacked into the data folder the first time Discord is opened. Nothing is
+# downloaded. The browser engine itself is the WebView2 Runtime that is part of Windows 11.
+$ChatPack = ''
+$ChatFiles = 'Microsoft.Web.WebView2.Core.dll', 'Microsoft.Web.WebView2.WinForms.dll', 'WebView2Loader.dll'
+$ChatDir = Join-Path $DataDir "chat\$AppVersion"
+$ChatProfile = Join-Path $DataDir 'discord-web'
+$ChatHome = 'https://discord.com/login'       # signed in already: Discord goes straight on to your chats
+$script:Chat = @{ Loaded = $false; State = 'off'; Note = ''; View = $null; Open = $false }
+function Write-ChatLog($text) { Append-Log ("[{0}] Discord: {1}" -f (Get-Date -Format 'HH:mm:ss'), $text) }
+
+# where the files are: a folder named by RICHPRESENCE_CHAT, "chat" next to the program, or the unpacked copy
+function Get-ChatFolder {
+    foreach ($d in $env:RICHPRESENCE_CHAT, (Join-Path (Split-Path $SelfPath) 'chat'), $ChatDir) {
+        if ($d -and -not (@($ChatFiles | Where-Object { -not (Test-Path (Join-Path $d $_)) }).Count)) { return $d }
+    }
+    $null
+}
+function Start-Chat {
+    if ($script:Chat.Loaded) { return $true }
+    try {
+        $dir = Get-ChatFolder
+        if (-not $dir) { Expand-ChatPack; $dir = Get-ChatFolder }
+        if (-not $dir) { throw 'this build doesn''t include it (it comes with the released version)' }
+        if ([IntPtr]::Size -ne 8) { throw 'it needs 64-bit Windows' }
+        Add-Type -Path (Join-Path $dir 'Microsoft.Web.WebView2.Core.dll')
+        Add-Type -Path (Join-Path $dir 'Microsoft.Web.WebView2.WinForms.dll')
+        [Microsoft.Web.WebView2.Core.CoreWebView2Environment]::SetLoaderDllFolderPath($dir)
+        $runtime = $null
+        try { $runtime = [Microsoft.Web.WebView2.Core.CoreWebView2Environment]::GetAvailableBrowserVersionString() } catch {}
+        if (-not $runtime) { throw 'Microsoft Edge WebView2 Runtime isn''t installed (Windows 11 has it; on Windows 10 get it from microsoft.com/edge/webview2)' }
+    } catch {
+        $script:Chat.State = 'failed'; $script:Chat.Note = "Discord can't open here: $($_.Exception.Message)."
+        Write-ChatLog $script:Chat.Note
+        return $false
+    }
+    $script:Chat.Loaded = $true; $script:Chat.State = 'ready'; $script:Chat.Note = ''
+    $true
+}
+
+# unpacks the files that came inside the EXE (only the ones that are needed, by exact name)
+function Expand-ChatPack {
+    if (-not $ChatPack) { return }
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    New-Item -ItemType Directory -Path $ChatDir -Force | Out-Null
+    $ms = New-Object System.IO.MemoryStream(, [Convert]::FromBase64String($ChatPack))
+    $z = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Read)
+    try {
+        foreach ($name in $ChatFiles) {
+            $e = $z.Entries | Where-Object { $_.FullName -eq $name } | Select-Object -First 1
+            if (-not $e) { throw "$name is missing from this build" }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $ChatDir $name), $true)
+        }
+    } finally { $z.Dispose(); $ms.Dispose() }
+}
+
+# Discord stays on Discord: anything else (a link someone sent) opens in the normal browser instead
+function Test-ChatUrl($url) {
+    try { $u = [uri]"$url" } catch { return $false }
+    if ("$url" -eq 'about:blank') { return $true }
+    ($u.Scheme -eq 'https') -and ($u.Host -match '(^|\.)(discord\.com|discordapp\.com|discord\.gg)$')
+}
+function Open-ChatLink($url) {
+    try { $u = [uri]"$url"; if ($u.Scheme -in 'http', 'https') { Start-Process $u.AbsoluteUri } } catch {}
+}
+
+# the browser lives in a window of its own that sits over the overlay's widgets
+$ovWeb = New-Object System.Windows.Forms.Form
+$ovWeb.FormBorderStyle = 'None'; $ovWeb.ShowInTaskbar = $false; $ovWeb.TopMost = $true; $ovWeb.StartPosition = 'Manual'
+$ovWeb.BackColor = $cCard; $ovWeb.Owner = $ov; $ovWeb.Text = 'RichPresence - Discord'
+$ovWeb.add_FormClosing({ param($s, $e) if (-not $script:reallyQuit -and $e.CloseReason -eq 'UserClosing') { $e.Cancel = $true; $script:Chat.Open = $false; Set-OvWeb } })
+function New-ChatView {
+    $wv = New-Object Microsoft.Web.WebView2.WinForms.WebView2
+    $props = New-Object Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties
+    $props.UserDataFolder = $ChatProfile
+    $wv.CreationProperties = $props
+    $wv.Dock = 'Fill'; $wv.DefaultBackgroundColor = $cCard
+    $wv.add_CoreWebView2InitializationCompleted({
+        param($s, $e)
+        if (-not $e.IsSuccess) {
+            $script:Chat.Note = "Discord couldn't start here: $($e.InitializationException.Message)"
+            Write-ChatLog $script:Chat.Note
+            return
+        }
+        $core = $s.CoreWebView2
+        $core.Settings.AreDevToolsEnabled = $false
+        $core.Settings.IsStatusBarEnabled = $false
+        $core.add_NewWindowRequested({ param($s2, $a) $a.Handled = $true; Open-ChatLink "$($a.Uri)" })
+        # Discord's page looks for the Discord app on this PC (a local address) and, when it finds it, hands
+        # over to it and shows "Discord App Launched" instead of the chat. Here it must stay in the overlay,
+        # so the page isn't allowed to reach this PC's own addresses at all.
+        foreach ($local in 'http://127.0.0.1:*', 'http://localhost:*', 'https://127.0.0.1:*', 'https://localhost:*') {
+            $core.AddWebResourceRequestedFilter($local, [Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext]::All)
+        }
+        $core.add_WebResourceRequested({ param($s2, $a) try { $a.Response = $s2.Environment.CreateWebResourceResponse($null, 403, 'Blocked', '') } catch {} })
+        $core.add_NavigationStarting({ param($s2, $a) if (-not (Test-ChatUrl "$($a.Uri)")) { $a.Cancel = $true; Open-ChatLink "$($a.Uri)" } })
+    })
+    $ovWeb.Controls.Add($wv)
+    $wv.Source = [uri]$ChatHome
+    $wv
+}
+# shows the browser over the widgets when Discord is open and the overlay is up, hides it otherwise
+function Set-OvWeb {
+    $show = $script:Chat.Open -and $ov.Visible -and $script:Chat.View
+    if ($show) {
+        $p = $ovRoot.PointToScreen((Pt 0 56))
+        $ovWeb.Bounds = New-Object System.Drawing.Rectangle($p.X, $p.Y, $ovRoot.Width, ($ovRoot.Height - 56))
+        if (-not $ovWeb.Visible) { $ovWeb.Show() }
+    } elseif ($ovWeb.Visible) { $ovWeb.Hide() }
+    $ovDiscordBtn.Text = $(if ($show) { 'Back' } else { 'Discord' })
+}
+function Open-OvDiscord {
+    if (-not (Start-Chat)) { return }
+    if (-not $script:Chat.View) {
+        try { $script:Chat.View = New-ChatView }
+        catch { $script:Chat.State = 'failed'; $script:Chat.Note = "Discord couldn't start here: $($_.Exception.Message)"; Write-ChatLog $script:Chat.Note; return }
+    }
+    else {
+        try { $at = "$($script:Chat.View.Source)"; if ($at -match '^https://discord\.com/(app|download|channels/@me)?/?$' -and "$($script:Chat.View.CoreWebView2.DocumentTitle)" -notmatch '\|') { $script:Chat.View.CoreWebView2.Navigate($ChatHome) } } catch {}
+    }
+    $script:Chat.Open = $true
+    Set-OvWeb
+}
+function Close-OvDiscord { $script:Chat.Open = $false; Set-OvWeb }
+
+# ---- Discord widget
+$ovChat = New-OvWidget 'Discord' 1188 56 380 522
+$ovChatIntro = New-Ctl System.Windows.Forms.Label $ovChat @{ Text = ''; UseMnemonic = $false; Location = (Pt 13 36); Size = (Sz 356 150) }
+$ovChatGo = New-OvButton $ovChat 'Open Discord' 12 196 200 36
+Style-Button $ovChatGo $true; $ovChatGo.Font = $fUi
+$ovChatForget = New-OvButton $ovChat 'Sign out and forget' 12 478 170 30
+$ovChatForget.Font = $fSmall
+$ovChatGo.add_Click({ Open-OvDiscord })
+$ovChatForget.add_Click({
+    # closes the browser and deletes its profile: the Discord sign-in, cookies and cache kept on this PC
+    $script:Chat.Open = $false
+    if ($script:Chat.View) { try { $ovWeb.Controls.Remove($script:Chat.View); $script:Chat.View.Dispose() } catch {}; $script:Chat.View = $null }
+    Set-OvWeb
+    $script:Chat.ForgetAt = (Get-Date).AddSeconds(2)      # the browser needs a moment to let go of its files
+})
+function Update-OvChat {
+    $c = $script:Chat
+    if ($c.ForgetAt -and (Get-Date) -ge $c.ForgetAt) {
+        $c.ForgetAt = $null
+        try { if (Test-Path $ChatProfile) { Remove-Item -LiteralPath $ChatProfile -Recurse -Force -ErrorAction Stop }; $c.Note = 'Signed out. The saved Discord sign-in was deleted from this PC.' }
+        catch { $c.Note = 'The saved sign-in is still in use. Quit RichPresence and try again.' }
+    }
+    $ovChatGo.Visible = ($c.State -in 'off', 'ready', 'failed')
+    $ovChatForget.Visible = ($c.State -eq 'ready') -and (Test-Path $ChatProfile)
+    switch ($c.State) {
+        'off'         { $ovChatIntro.Text = "Open Discord right here: all your chats, groups, history and calls, without leaving the game.`n`nSign in once on Discord's own page; RichPresence never sees your password."; $ovChatGo.Text = 'Open Discord' }
+        'ready'       { $ovChatIntro.Text = "Discord opens over the overlay. Sign in once on Discord's own page; RichPresence never sees your password.`n`nA call keeps going when you close the overlay. Links open in your normal browser.`n`n$($c.Note)"; $ovChatGo.Text = $(if ($c.Open) { 'Back to the overlay' } else { 'Open Discord' }) }
+        'failed'      { $ovChatIntro.Text = "$($c.Note)"; $ovChatGo.Text = 'Try again' }
+    }
+}
+
+# ---- phone: hands a number to Windows' Phone Link, which calls or texts through the paired phone
+$ovPhone = New-OvWidget 'Phone' 1188 590 380 110
+$ovPhoneNum = New-Ctl System.Windows.Forms.TextBox $ovPhone @{ Location = (Pt 13 38); Size = (Sz 170 24); BackColor = $cCardHi; ForeColor = $cText; BorderStyle = 'FixedSingle'; MaxLength = 24 }
+$ovPhoneCall = New-OvButton $ovPhone 'Call' 192 35 84 30
+$ovPhoneText = New-OvButton $ovPhone 'Text' 284 35 84 30
+$ovPhoneOpen = New-OvButton $ovPhone 'Open Phone Link' 12 72 170 30
+[void](New-Ctl System.Windows.Forms.Label $ovPhone @{ Text = 'Uses the phone paired in Phone Link.'; ForeColor = $cDim; Font = $fSmall; Location = (Pt 192 80); AutoSize = $true })
+$ovPhoneCall.Tag = 'tel'; $ovPhoneText.Tag = 'sms'; $ovPhoneOpen.Tag = 'ms-phone'
+foreach ($b in $ovPhoneCall, $ovPhoneText, $ovPhoneOpen) {
+    $b.add_Click({
+        $kind = "$($this.Tag)"
+        # only a phone number goes into the link: digits, with an optional + in front
+        $num = ($ovPhoneNum.Text -replace '[^\d+]', '') -replace '(?<!^)\+', ''
+        if ($kind -ne 'ms-phone' -and ($num -replace '\D', '').Length -lt 3) { $ovPhoneNum.Focus() | Out-Null; return }
+        Hide-Overlay
+        try { Start-Process $(if ($kind -eq 'ms-phone') { 'ms-phone:' } else { "${kind}:$num" }) }
+        catch { Append-Log ("[{0}] Phone Link didn't open: {1}" -f (Get-Date -Format 'HH:mm:ss'), $_.Exception.Message) }
+    })
+}
+
+# ---- one more column: on a wide screen chat sits beside the games, otherwise a button swaps the two
+$script:OvShowChat = $false
+$ovSwap = New-OvButton $ovTop 'More' 0 6 90 32
+$ovDiscordBtn = New-OvButton $ovTop 'Discord' 0 6 90 32
+$ovDiscordBtn.add_Click({ if ($script:Chat.Open -and $ovWeb.Visible) { Close-OvDiscord } else { Open-OvDiscord; if (-not $script:Chat.Open) { $script:OvShowChat = $true; Set-OvColumns } } })
+function Set-OvColumns {
+    $wide = [bool]$script:OvWide
+    $ovRoot.Width = $(if ($wide) { 1568 } else { 1172 })
+    $ovTop.Width = $ovRoot.Width
+    $ovClose.Left = $ovRoot.Width - 50; $ovClock.Left = $ovRoot.Width - 212
+    $ovDiscordBtn.Left = $ovRoot.Width - 312
+    $ovSwap.Visible = -not $wide; $ovSwap.Left = $ovRoot.Width - 412
+    $ovHint.Width = [math]::Max(100, $ovRoot.Width - 150 - $(if ($wide) { 322 } else { 422 }))
+    $chat = $wide -or $script:OvShowChat
+    $ovGames.Visible = $wide -or -not $script:OvShowChat
+    foreach ($w in $ovChat, $ovPhone) { $w.Left = $(if ($wide) { 1188 } else { 792 }); $w.Visible = $chat }
+    $ovSwap.Text = $(if ($script:OvShowChat) { 'Games' } else { 'More' })
+}
+$ovSwap.add_Click({ $script:OvShowChat = -not $script:OvShowChat; Set-OvColumns; Set-OvFocus $null })
+
 # ---- moving around with the controller: a frame shows where you are
 $script:OvFocus = $null
 $ovRing = @(1..4 | ForEach-Object { New-Ctl System.Windows.Forms.Panel $ovRoot @{ Size = (Sz 2 2); BackColor = $cAccent; Visible = $false } })
@@ -2830,7 +3030,7 @@ function Get-OvTargets {
             if (-not $k.Visible) { continue }
             if (Test-OvRow $k) { [void]$out.Add($k) }
             elseif ($k -is [System.Windows.Forms.ButtonBase] -or $k -is [System.Windows.Forms.TrackBar] -or $k -is [System.Windows.Forms.ComboBox]) { if ($k.Enabled) { [void]$out.Add($k) } }
-            elseif ($k -is [System.Windows.Forms.CheckedListBox]) { if ($k.Items.Count) { [void]$out.Add($k) } }
+            elseif ($k -is [System.Windows.Forms.ListBox]) { if ($k.Items.Count) { [void]$out.Add($k) } }
             elseif ($k.Controls.Count) { $todo.Push($k) }
         }
     }
@@ -2850,7 +3050,7 @@ function Set-OvFocus($c) {
     $script:OvFocus = $c
     if ($c) {
         if (Test-OvRow $c) { $ovGameList.ScrollControlIntoView($c) }
-        if ($c -is [System.Windows.Forms.CheckedListBox] -and $c.SelectedIndex -lt 0) { $c.SelectedIndex = 0 }
+        if ($c -is [System.Windows.Forms.ListBox] -and $c.SelectedIndex -lt 0 -and $c.Items.Count) { $c.SelectedIndex = 0 }
     }
     Update-OvRing
 }
@@ -2864,7 +3064,7 @@ function Move-OvFocus($dir) {
         if ($v -ne $cur.Value) { $cur.Value = $v; Set-OvBar $cur; if ($cur -eq $ovRgbBright) { Save-Settings $Settings } }
         return
     }
-    if ($cur -is [System.Windows.Forms.CheckedListBox] -and $dir -in 'Up', 'Down') {
+    if ($cur -is [System.Windows.Forms.ListBox] -and $dir -in 'Up', 'Down') {
         $i = $cur.SelectedIndex + $(if ($dir -eq 'Down') { 1 } else { -1 })
         if ($i -ge 0 -and $i -lt $cur.Items.Count) { $cur.SelectedIndex = $i; return }
     }
@@ -2905,6 +3105,7 @@ function Invoke-OvFocus {
         if ($i -ge 0) { $c.SetItemChecked($i, -not $c.GetItemChecked($i)) }
         return
     }
+    if ($c -is [System.Windows.Forms.ListBox]) { return }       # moving up and down already picks the friend
     [void]$OvOnClick.Invoke($c, @([System.EventArgs]::Empty))
 }
 function Invoke-OvPad($what) {
@@ -2955,6 +3156,7 @@ function Update-Overlay {
         $ovRgbSwatch.BackColor = $(if ($script:Rgb.Running) { [System.Drawing.Color]::FromArgb(255, ($col -shr 16) -band 255, ($col -shr 8) -band 255, $col -band 255) } else { $cCardHi })
     }
     if ($script:OvTick % 4 -eq 0) { Update-OvAudio; Update-OvGames }
+    Update-OvChat
     if ($script:OvFocus) { Update-OvRing }
     $script:OvTick++
 }
@@ -2963,6 +3165,8 @@ function Show-Overlay {
     if ($ov.Visible) { return }
     $b = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).Bounds
     $ovDim.Bounds = $b; $ov.Bounds = $b
+    $script:OvWide = ($b.Width -ge 1600)
+    Set-OvColumns
     $ovRoot.Location = Pt ([math]::Max(0, [int](($b.Width - $ovRoot.Width) / 2))) ([math]::Max(0, [int](($b.Height - $ovRoot.Height) / 2)))
     $ovHint.Text = "$($Settings.overlay_hotkey) or Esc to close$(if ($Settings.overlay_controller) { '.  Controller: logo button opens, d-pad moves, A / Cross picks, B / Circle closes' })"
     Set-OvFocus $null
@@ -2978,6 +3182,7 @@ function Show-Overlay {
     $script:OvTick = 0
     try { Update-Overlay } catch {}
     $ovDim.Show(); $ov.Show(); $ov.Activate()
+    Set-OvWeb                # Discord comes back if it was open last time
     $ovTimer.Start()
     if ($script:OvOk) { $script:Pad.Nav = $true }
 }
@@ -2985,6 +3190,7 @@ function Hide-Overlay {
     if (-not $ov.Visible) { return }
     $ovTimer.Stop()
     if ($script:OvOk) { $script:Pad.Nav = $false }
+    $ovWeb.Hide()
     $ov.Hide(); $ovDim.Hide()
 }
 function Switch-Overlay { if ($ov.Visible) { Hide-Overlay } else { Show-Overlay } }
@@ -3191,6 +3397,7 @@ $form.add_FormClosing({
     Stop-Presence
     if ($script:ScanJob) { Stop-Block $script:ScanJob $null 0 }
     $Sync.BridgeStop = $true; if ($script:BridgeJob) { Stop-Block $script:BridgeJob $null 2000 }
+    try { if ($script:Chat.View) { $script:Chat.View.Dispose() } } catch {}
     try { Hide-Overlay; if ($script:OvOk) { $script:Rgb.Stop(); $script:Obs.Stop(); $script:Hotkey.Dispose(); $script:Pad.Dispose() } } catch {}
     $tray.Visible = $false; $tray.Dispose()
 })

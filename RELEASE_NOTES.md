@@ -1,3 +1,36 @@
+## RichPresence 3.3.0
+
+### Discord inside the overlay (Windows)
+Press **Discord** in the overlay's top bar and Discord opens right there, over your game. It is Discord's
+own web app in a built-in browser, so it is the real thing: every chat in Discord's order, pins, group
+chats, full history, pictures and voice calls. **Back** returns to the widgets.
+
+- Sign in once on Discord's own page (scanning the QR code with your phone is quickest). RichPresence
+  never sees your password; the sign-in is kept in the browser's own folder on your PC.
+- A call keeps going when you close the overlay.
+- Links people send open in your normal browser, not in the overlay.
+- **Sign out and forget** in the Discord column closes it and deletes that saved sign-in.
+
+Good to know:
+- It needs Microsoft's WebView2 Runtime, which is part of Windows 11. On Windows 10, install it from
+  microsoft.com/edge/webview2.
+- The controller opens and closes the overlay but can't click around inside Discord; that needs a mouse
+  and keyboard.
+- It uses about as much memory as a Discord browser tab, and only once you've opened it.
+- RichPresence is still one file and downloads nothing for this: three small Microsoft files that drive
+  the browser are inside the EXE and are unpacked the first time you open Discord.
+
+### Phone (Windows)
+A **Phone** box in the overlay: type a number and press **Call** or **Text**, and Windows' Phone Link takes
+over with your paired phone. **Open Phone Link** opens it directly. Your texts are not shown in the
+overlay; Windows gives apps no way to read them. These buttons were **not yet tried end to end**.
+
+### Layout
+On screens 1600 pixels wide or more the overlay has a fourth column (Discord and Phone). On smaller
+screens a **More** button in the top bar swaps it with the Games column.
+
+Linux, Android and iPhone: no changes, only the version number.
+
 ## RichPresence 3.2.2
 
 ### Use the overlay with your controller (Windows)

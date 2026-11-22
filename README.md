@@ -85,8 +85,12 @@ Press **Ctrl+Alt+G**, or the **Xbox / PS button** on your controller, while you 
 | **OBS** | Start or stop recording, go live, save a replay, switch scene. Turn on **Tools > WebSocket Server Settings > Enable WebSocket server** in OBS first. |
 | **Lights** | Your RGB lights follow the colour of the screen. Needs [OpenRGB](https://openrgb.org) open with its SDK server running. |
 | **Discord** | Presence on or off, and your custom statuses. |
+| **Discord, the app itself** | The **Discord** button in the top bar opens Discord over your game: all your chats, groups, history and calls. Sign in once on Discord's own page. |
+| **Phone** | Type a number and press Call or Text; Windows' Phone Link does the rest with your paired phone. |
 
 It shows over borderless and windowed games, which is most games today, but not over true exclusive fullscreen: nothing is put inside the game, so anti-cheat has nothing to object to. Change or turn off the shortcut at the bottom of **Settings**.
+
+Discord in the overlay is Discord's own web app in a built-in browser (Microsoft's WebView2, part of Windows 11). RichPresence never sees your password; the sign-in is kept in the browser's own folder on your PC, and **Sign out and forget** deletes it. Links people send open in your normal browser. Inside Discord you need a mouse and keyboard.
 
 If the controller button opens something else instead: tick **Stop that button opening Xbox Game Bar** in Settings (it turns off the Windows switch and puts it back when you untick), and in Steam turn off **Settings > Controller > Guide button focuses Steam**.
 
@@ -174,7 +178,7 @@ Discord shows one activity per Discord application, so each card uses its own ap
 Small unsigned tools that watch running programs and talk to Discord sometimes get flagged by heuristic scanners. This one isn't malware, and you don't have to take that on faith:
 
 - **The whole program is one readable file:** [`src/RichPresence.ps1`](src/RichPresence.ps1). The EXE is that script wrapped by [PS2EXE](https://github.com/MScholtes/PS2EXE), and PS2EXE-built files are a common false-positive target.
-- **What it does:** list running process names, read the focused window's title and your browsers' window titles, read the "now playing" info Windows shows in its media controls (Apple Music, Spotify, and videos in browsers), and talk to the Discord app on your PC over its local pipe. The overlay adds a global keyboard shortcut, the logo button on a controller, media keys, app volume, and (only if you turn the light sync on) the average colour of the screen. To control OBS it reads the port and password OBS keeps in its own settings folder; they are used only to talk to OBS on your PC and are never stored or sent anywhere.
+- **What it does:** list running process names, read the focused window's title and your browsers' window titles, read the "now playing" info Windows shows in its media controls (Apple Music, Spotify, and videos in browsers), and talk to the Discord app on your PC over its local pipe. The overlay adds a global keyboard shortcut, the logo button on a controller, media keys, app volume, and (only if you turn the light sync on) the average colour of the screen. To control OBS it reads the port and password OBS keeps in its own settings folder; they are used only to talk to OBS on your PC and are never stored or sent anywhere. The first time you open Discord in the overlay it unpacks three Microsoft WebView2 files from inside the EXE into its data folder (nothing is downloaded) and starts Microsoft's browser engine to show discord.com.
 - **What it never does:** inject code, read or write game memory, modify game files, log keystrokes, or ask for passwords/tokens.
 - **Network calls:** `discord.com` (the public list of known games), `enka.network` (Genshin profile, optional), `itunes.apple.com` (album art), `lrclib.net` (lyrics), `google.com/s2/favicons` (app and streaming-service icons), `api.tvmaze.com` and `v3-cinemeta.strem.io` (show and movie posters, optional). Nothing is sent to the author.
 - **Verify or build it yourself:** releases are built by GitHub Actions from this repo, so you can [build it yourself](#build-it-yourself) and compare. You can also upload the EXE to [VirusTotal](https://www.virustotal.com) and see that the few flags, if any, are generic heuristics from PS2EXE.
@@ -196,6 +200,7 @@ RichPresence has **no telemetry, no accounts and no analytics**, and nothing is 
 | Request | What is sent | When |
 |---|---|---|
 | `discord.com` | Nothing about you. It downloads Discord's public list of known games (cached for 7 days). | On a scan |
+| `discord.com` and Discord's other addresses | Whatever Discord's own web app sends when you use it: you are signed in to Discord there, in a built-in browser. RichPresence doesn't read or store any of it. | Only after you press **Discord** in the overlay |
 | `itunes.apple.com` | The song title, artist and album, to find album art | Music card (Apple Music or Spotify) + "Show album art" on |
 | `lrclib.net` | The song title, artist, album and length, to find lyrics | Music card (Apple Music or Spotify) + "Show the current lyric line" on |
 | `enka.network` | Your Genshin UID, to read your public profile | Only if you enter a UID in Settings |
@@ -230,6 +235,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
 That installs the [`ps2exe`](https://github.com/MScholtes/PS2EXE) module for your user and writes `dist\RichPresence.exe`.
+It also fetches Microsoft's WebView2 package from nuget.org (one fixed version, checked against a checksum in `build-chat.ps1`) and packs three files from it into the EXE; they show Discord in the overlay.
 Or skip building and run it directly: `powershell -ExecutionPolicy Bypass -File src\RichPresence.ps1`.
 
 Debug options: `-Headless` (no window), `-ScanOnly` (print detected games), `-Play "<game id>"` (launch a game).
