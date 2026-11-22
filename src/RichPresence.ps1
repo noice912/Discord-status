@@ -33,7 +33,7 @@ $DefaultAppId   = '1544831111128154213'   # "Playing" - current-app card
 # built-in apps that custom statuses can borrow when the user hasn't made their own Discord app (one card each)
 $CustomPoolIds  = @('1553178514365358100', '1553247468957990943')
 $RepoUrl      = 'https://github.com/noice912/Discord-status'
-$AppVersion   = '3.3.1'     # build.ps1 reads this; bump it for every release
+$AppVersion   = '3.3.2'     # build.ps1 reads this; bump it for every release
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
 # ===========================================================================
@@ -68,6 +68,7 @@ function New-DefaultSettings {
         overlay_controller     = $true      # ...and with the Xbox / PS button on a controller
         gamebar_button_off     = $false     # stop Windows opening Xbox Game Bar on that button (a Windows setting, put back when unticked)
         gamebar_button_before  = ''         # what that Windows setting was before we changed it ('' = we haven't)
+        pause_remote_play      = $false     # pause PS Remote Play while the overlay is open, so the PlayStation doesn't get the controller
         rgb_sync               = $false     # lights follow the screen (through OpenRGB)
         rgb_brightness         = 100
     }
@@ -1595,6 +1596,8 @@ $chkGameBar = New-Check $pSettings 'Stop that button opening Xbox Game Bar (chan
 $chkGameBar.Left = 44
 $padHint = New-Ctl System.Windows.Forms.Label $pSettings @{ Text = 'Steam has its own switch: Steam > Settings > Controller > turn off "Guide button focuses Steam".'; UseMnemonic = $false; ForeColor = $cDim; Font = $fSmall; Location = (Pt 62 608); AutoSize = $true }
 $chkPad.add_CheckedChanged({ $chkGameBar.Enabled = $chkPad.Checked })
+$chkPauseRp = New-Check $pSettings 'Pause PS Remote Play while the overlay is open, so the PlayStation doesn''t get the controller' 636
+$pauseHint = New-Ctl System.Windows.Forms.Label $pSettings @{ Text = 'Experimental. Its picture freezes too, and the PlayStation may drop the connection if the overlay stays open for long.'; UseMnemonic = $false; ForeColor = $cDim; Font = $fSmall; Location = (Pt 42 660); AutoSize = $true }
 
 # ---- Log page
 $log = New-Ctl System.Windows.Forms.TextBox $pLog @{ Dock = 'Fill'; Multiline = $true; ReadOnly = $true; ScrollBars = 'Vertical'; BackColor = $cCard; ForeColor = $cText; BorderStyle = 'None'; Font = (New-Object System.Drawing.Font('Consolas', 9)) }
@@ -1615,6 +1618,7 @@ function Apply-ToUi {
     $chkUpdate.Checked = [bool]$Settings.auto_update
     $chkOverlay.Checked = [bool]$Settings.overlay_enabled; $txtHotkey.Text = "$($Settings.overlay_hotkey)"
     $chkPad.Checked = [bool]$Settings.overlay_controller; $chkGameBar.Checked = [bool]$Settings.gamebar_button_off; $chkGameBar.Enabled = $chkPad.Checked
+    $chkPauseRp.Checked = [bool]$Settings.pause_remote_play
 }
 function Read-FromUi {
     $Settings.genshin_uid = $txtUid.Text.Trim()
@@ -1630,6 +1634,7 @@ function Read-FromUi {
     $Settings.auto_update = $chkUpdate.Checked
     $Settings.overlay_enabled = $chkOverlay.Checked
     $Settings.overlay_controller = $chkPad.Checked; $Settings.gamebar_button_off = $chkGameBar.Checked
+    $Settings.pause_remote_play = $chkPauseRp.Checked
     # a shortcut that can't be used is put back to the last good one
     if (ConvertTo-Hotkey $txtHotkey.Text) { $Settings.overlay_hotkey = $txtHotkey.Text.Trim() } else { $txtHotkey.Text = "$($Settings.overlay_hotkey)" }
     Save-Settings $Settings
@@ -1982,6 +1987,32 @@ public static class RPKeys {
     // shows a window on top without giving it the keyboard
     public static void ShowQuiet(IntPtr h) { ShowWindow(h, 4); SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x0013); }   // no-activate; topmost, no move/size/activate
     public static bool IsFront(IntPtr h) { return GetForegroundWindow() == h; }
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    public static IntPtr Front() { return GetForegroundWindow(); }
+    // Makes a window the active one for real. Windows refuses that to a program the person didn't just
+    // press a key or click in - and a controller button is neither - so the overlay would open on top but
+    // the game (or PS Remote Play) underneath would still be the active window and keep taking the
+    // controller. Joining the active window's input queue for a moment is the allowed way round that; an
+    // Alt tap is the fallback.
+    public static bool BringToFront(IntPtr h) {
+        if (h == IntPtr.Zero || !IsWindow(h)) return false;
+        IntPtr front = GetForegroundWindow();
+        if (front == h) return true;
+        uint pid, mine = GetCurrentThreadId(), theirs = front == IntPtr.Zero ? 0 : GetWindowThreadProcessId(front, out pid);
+        bool joined = theirs != 0 && theirs != mine && AttachThreadInput(mine, theirs, true);
+        try { BringWindowToTop(h); SetForegroundWindow(h); }
+        finally { if (joined) AttachThreadInput(mine, theirs, false); }
+        if (GetForegroundWindow() == h) return true;
+        keybd_event(0x12, 0, 0, UIntPtr.Zero);
+        SetForegroundWindow(h);
+        keybd_event(0x12, 0, 2, UIntPtr.Zero);
+        return GetForegroundWindow() == h;
+    }
     // types text as characters, whatever the keyboard layout is (64-bit Windows only)
     [StructLayout(LayoutKind.Explicit, Size = 40)] struct KeyInput {
         [FieldOffset(0)] public uint Type; [FieldOffset(8)] public ushort Vk; [FieldOffset(10)] public ushort Scan;
@@ -1996,6 +2027,22 @@ public static class RPKeys {
             k[2 * i + 1].Type = 1; k[2 * i + 1].Scan = text[i]; k[2 * i + 1].Flags = 6;  // ...and let go
         }
         SendInput((uint)k.Length, k, 40);
+    }
+}
+
+// Pauses and un-pauses another program of yours (every thread of it stops until it is un-paused).
+// Used, only when the person turns it on, to keep PS Remote Play from passing the controller to the
+// PlayStation while the overlay is open: it reads the controller whether or not it is the active window.
+public static class RPProc {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("ntdll.dll")] static extern int NtSuspendProcess(IntPtr h);
+    [DllImport("ntdll.dll")] static extern int NtResumeProcess(IntPtr h);
+    public static bool Pause(int pid, bool on) {
+        IntPtr h = OpenProcess(0x0800, false, pid);         // only the right to pause and un-pause
+        if (h == IntPtr.Zero) return false;
+        try { return (on ? NtSuspendProcess(h) : NtResumeProcess(h)) == 0; }
+        finally { CloseHandle(h); }
     }
 }
 
@@ -3246,6 +3293,28 @@ function Invoke-OvFocus {
     if ($c -is [System.Windows.Forms.ListBox]) { return }       # moving up and down already picks the friend
     [void]$OvOnClick.Invoke($c, @([System.EventArgs]::Empty))
 }
+# ---- PS Remote Play reads the controller even when it isn't the active window, so the PlayStation would
+# follow everything done in the overlay. With the setting on, it is paused shortly after the overlay opens
+# (after the logo button has been let go, so the PlayStation doesn't see it held) and un-paused on closing.
+$script:PausedPids = @()
+$ovPauseTimer = New-Object System.Windows.Forms.Timer
+$ovPauseTimer.Interval = 400
+function Resume-RemotePlay {
+    $ovPauseTimer.Stop()
+    foreach ($id in @($script:PausedPids)) { try { [void][RPProc]::Pause([int]$id, $false) } catch {} }
+    if ($script:PausedPids.Count) { Append-Log ("[{0}] PS Remote Play carries on." -f (Get-Date -Format 'HH:mm:ss')) }
+    $script:PausedPids = @()
+}
+function Suspend-RemotePlay {
+    $ovPauseTimer.Stop()
+    if (-not $script:OvOk -or -not $Settings.pause_remote_play -or -not $ov.Visible -or $script:PausedPids.Count) { return }
+    foreach ($p in @(Get-Process -Name RemotePlay -ErrorAction SilentlyContinue)) {
+        try { if ([RPProc]::Pause($p.Id, $true)) { $script:PausedPids += $p.Id } } catch {}
+    }
+    if ($script:PausedPids.Count) { Append-Log ("[{0}] PS Remote Play paused while the overlay is open." -f (Get-Date -Format 'HH:mm:ss')) }
+}
+$ovPauseTimer.add_Tick({ try { Suspend-RemotePlay } catch {} })
+
 # the line of help in the top bar: what the keys and the controller do right now
 function Set-OvHint {
     $pad = [bool]$Settings.overlay_controller
@@ -3318,7 +3387,7 @@ function Move-OvKb($dir) {
 # typing goes to whichever window has the keyboard: make sure that is Discord's
 function Set-KbTarget {
     if ($script:Kb.Dry) { return }
-    try { if (-not [RPKeys]::IsFront($ovWeb.Handle)) { $ovWeb.Activate(); if ($script:Chat.View) { [void]$script:Chat.View.Focus() }; [System.Windows.Forms.Application]::DoEvents() } } catch {}
+    try { if (-not [RPKeys]::IsFront($ovWeb.Handle)) { [void][RPKeys]::BringToFront($ovWeb.Handle); if ($script:Chat.View) { [void]$script:Chat.View.Focus() }; [System.Windows.Forms.Application]::DoEvents() } } catch {}
 }
 function Invoke-KbKey {
     $kb = $script:Kb
@@ -3448,7 +3517,13 @@ function Show-Overlay {
     Start-OvObs
     $script:OvTick = 0
     try { Update-Overlay } catch {}
+    # which window was active (the game, PS Remote Play): it gets the keyboard and controller back on closing
+    $script:OvPrev = $(if ($script:OvOk) { [RPKeys]::Front() } else { [IntPtr]::Zero })
     $ovDim.Show(); $ov.Show(); $ov.Activate()
+    # really take over as the active window, so a program underneath that only listens while it is active
+    # (PS Remote Play does) stops getting the controller until the overlay closes
+    if ($Settings.pause_remote_play) { $ovPauseTimer.Start() }
+    if ($script:OvOk -and -not [RPKeys]::BringToFront($ov.Handle)) { Append-Log ("[{0}] The overlay opened but couldn't become the active window; what is underneath may still react to the controller." -f (Get-Date -Format 'HH:mm:ss')) }
     Set-OvWeb                # Discord comes back if it was open last time
     $ovTimer.Start()
     if ($script:OvOk) { $script:Pad.Nav = $true }
@@ -3458,8 +3533,14 @@ function Hide-Overlay {
     $ovTimer.Stop()
     Hide-OvKeyboard
     if ($script:OvOk) { $script:Pad.Nav = $false; $script:Pad.Pointer = $false }
+    Resume-RemotePlay        # before it gets the window back
+    # hand the keyboard and controller back to what was active before, unless the person has moved on to something else
+    $mine = @($ov.Handle, $ovDim.Handle, $ovWeb.Handle, $ovKb.Handle)
+    $back = $script:OvOk -and $script:OvPrev -and ($script:OvPrev -ne [IntPtr]::Zero) -and ($mine -notcontains $script:OvPrev) -and (($mine -contains [RPKeys]::Front()) -or ([RPKeys]::Front() -eq [IntPtr]::Zero))
     $ovWeb.Hide()
     $ov.Hide(); $ovDim.Hide()
+    if ($back) { [void][RPKeys]::BringToFront($script:OvPrev) }
+    $script:OvPrev = [IntPtr]::Zero
 }
 function Switch-Overlay { if ($ov.Visible) { Hide-Overlay } else { Show-Overlay } }
 $ovClose.add_Click({ Hide-Overlay })
@@ -3476,6 +3557,8 @@ if ($script:OvOk) {
     Set-OverlayHotkey
     Set-OverlayController
     if ($Settings.rgb_sync) { Set-RgbSync $true }
+    # RichPresence was ended while PS Remote Play was paused? Starting it again lets Remote Play go.
+    if ($Settings.pause_remote_play) { foreach ($p in @(Get-Process -Name RemotePlay -ErrorAction SilentlyContinue)) { try { [void][RPProc]::Pause($p.Id, $false) } catch {} } }
 }
 $miOverlay = New-Object System.Windows.Forms.ToolStripMenuItem('Overlay')
 $miOverlay.add_Click({ Show-Overlay })
@@ -3665,6 +3748,7 @@ $form.add_FormClosing({
     Stop-Presence
     if ($script:ScanJob) { Stop-Block $script:ScanJob $null 0 }
     $Sync.BridgeStop = $true; if ($script:BridgeJob) { Stop-Block $script:BridgeJob $null 2000 }
+    try { Resume-RemotePlay } catch {}       # never leave it paused
     try { if ($script:Chat.View) { $script:Chat.View.Dispose() } } catch {}
     try { Hide-Overlay; if ($script:OvOk) { $script:Rgb.Stop(); $script:Obs.Stop(); $script:Hotkey.Dispose(); $script:Pad.Dispose() } } catch {}
     $tray.Visible = $false; $tray.Dispose()

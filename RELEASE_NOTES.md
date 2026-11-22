@@ -1,3 +1,28 @@
+## RichPresence 3.3.2
+
+### PS Remote Play: keep the controller to the overlay (Windows)
+PS Remote Play passes your controller to the PlayStation even when another window is in front, so the
+console followed everything you did in the overlay. There is now a setting for that, at the bottom of
+**Settings**: **Pause PS Remote Play while the overlay is open**. It is off by default.
+
+With it on, Remote Play is paused shortly after the overlay opens and carries on when it closes.
+
+Good to know:
+- While it is paused its picture freezes too. The game on the PlayStation keeps running without you.
+- The button press that opens the overlay still reaches the PlayStation, so its own menu may pop up.
+- It was tried on one PC and the connection held. How long a PlayStation puts up with it isn't known; if
+  yours drops the connection, keep overlay visits short or leave the setting off.
+- Remote Play is un-paused when the overlay closes and when RichPresence quits. If RichPresence is ever
+  ended in the middle, starting it again un-pauses Remote Play.
+
+### The overlay takes over properly when opened from a controller (Windows)
+Opened with the controller's logo button, the overlay used to appear on top while the game underneath was
+still the active window. It now becomes the active window however it was opened, and hands that back to
+the game when it closes, so you don't have to click back in. Games that only listen while they are active
+stop reacting to the controller while the overlay is up.
+
+Linux, Android and iPhone: no changes, only the version number.
+
 ## RichPresence 3.3.1
 
 ### Use Discord in the overlay with your controller (Windows)
