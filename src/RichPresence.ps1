@@ -33,7 +33,7 @@ $DefaultAppId   = '1544831111128154213'   # "Playing" - current-app card
 # built-in apps that custom statuses can borrow when the user hasn't made their own Discord app (one card each)
 $CustomPoolIds  = @('1553178514365358100', '1553247468957990943')
 $RepoUrl      = 'https://github.com/noice912/Discord-status'
-$AppVersion   = '3.3.3'     # build.ps1 reads this; bump it for every release
+$AppVersion   = '3.3.4'     # build.ps1 reads this; bump it for every release
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
 # ===========================================================================
@@ -2562,6 +2562,75 @@ public class RPRgb {
         if (w == 0) return 0;
         return ((int)(r / w) << 16) | ((int)(g / w) << 8) | (int)(b / w);
     }
+    // ---- a capture card's frame, read in the layout it really arrives in.
+    // Capture cards deliver YUV video (NV12 or YUY2), not ready-made red/green/blue. Reading those bytes as if
+    // they were BGRA gives a green picture - that was the bug in 3.3.3 - so each layout is sampled as itself.
+    [ComImport, Guid("5B0D3235-4DBA-4D44-865E-8F1D0E4FD04D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMemoryBufferByteAccess { [PreserveSig] int GetBuffer(out IntPtr buffer, out uint capacity); }
+
+    static int Clamp(double v) { return v < 0 ? 0 : v > 255 ? 255 : (int)(v + 0.5); }
+    // video YUV (16-235 "studio" range) -> 0xRRGGBB; HD pictures use the BT.709 numbers, smaller ones BT.601
+    public static int YuvToRgb(int y, int u, int v, bool hd) {
+        double c = 1.164 * (y - 16), d = u - 128, e = v - 128;
+        double r, g, b;
+        if (hd) { r = c + 1.793 * e; g = c - 0.213 * d - 0.533 * e; b = c + 2.112 * d; }
+        else { r = c + 1.596 * e; g = c - 0.392 * d - 0.813 * e; b = c + 2.017 * d; }
+        return (Clamp(r) << 16) | (Clamp(g) << 8) | Clamp(b);
+    }
+    // The colour of a frame from a grid of 48x27 samples, colourful ones counting more than grey ones.
+    // layout: "Bgra8", "Nv12" or "Yuy2". start0/stride0 describe the first plane, start1/stride1 NV12's colour plane.
+    // read(i) returns the byte at i, or -1 outside the buffer. Returns -1 when the frame can't be read.
+    static int AverageWith(Func<int, int> read, string layout, int width, int height, int start0, int stride0, int start1, int stride1) {
+        if (width <= 0 || height <= 0 || stride0 <= 0) return -1;
+        bool hd = height >= 720;
+        long r = 0, g = 0, b = 0, w = 0;
+        int stepX = Math.Max(1, width / 48), stepY = Math.Max(1, height / 27);
+        for (int y = stepY / 2; y < height; y += stepY) for (int x = stepX / 2; x < width; x += stepX) {
+            int cr, cg, cb;
+            if (layout == "Bgra8") {
+                int i = start0 + y * stride0 + 4 * x;
+                cb = read(i); cg = read(i + 1); cr = read(i + 2);
+                if (cb < 0 || cg < 0 || cr < 0) return -1;
+            } else {
+                int yy, u, v;
+                if (layout == "Yuy2") {             // Y0 U Y1 V for every two pixels
+                    int row = start0 + y * stride0, pair = row + 4 * (x / 2);
+                    yy = read(row + 2 * x); u = read(pair + 1); v = read(pair + 3);
+                } else if (layout == "Nv12") {      // a plane of Y, then a half-size plane of U V pairs
+                    if (stride1 <= 0) return -1;
+                    int uv = start1 + (y / 2) * stride1 + 2 * (x / 2);
+                    yy = read(start0 + y * stride0 + x); u = read(uv); v = read(uv + 1);
+                } else return -1;
+                if (yy < 0 || u < 0 || v < 0) return -1;
+                int rgb = YuvToRgb(yy, u, v, hd);
+                cr = (rgb >> 16) & 255; cg = (rgb >> 8) & 255; cb = rgb & 255;
+            }
+            int max = Math.Max(cr, Math.Max(cg, cb)), min = Math.Min(cr, Math.Min(cg, cb));
+            int wt = 1 + (max - min);
+            r += cr * wt; g += cg * wt; b += cb * wt; w += wt;
+        }
+        if (w == 0) return -1;
+        return ((int)(r / w) << 16) | ((int)(g / w) << 8) | (int)(b / w);
+    }
+    // from bytes in memory (used by the checks)
+    public static int AverageBytes(byte[] data, string layout, int width, int height, int start0, int stride0, int start1, int stride1) {
+        if (data == null) return -1;
+        return AverageWith(delegate(int i) { return i >= 0 && i < data.Length ? data[i] : -1; }, layout, width, height, start0, stride0, start1, stride1);
+    }
+    // from a locked Windows bitmap buffer (the object LockBuffer().CreateReference() gives), without copying the frame
+    public static int AverageFrame(object memoryReference, string layout, int width, int height, int start0, int stride0, int start1, int stride1) {
+        // The reference is let go of here as well: PowerShell sees it as a bare COM object with no Dispose of its own.
+        try {
+            IMemoryBufferByteAccess access = memoryReference as IMemoryBufferByteAccess;
+            if (access == null) return -1;
+            IntPtr p; uint capacity;
+            if (access.GetBuffer(out p, out capacity) != 0 || p == IntPtr.Zero) return -1;
+            return AverageWith(delegate(int i) { return i >= 0 && (uint)i < capacity ? Marshal.ReadByte(p, i) : -1; }, layout, width, height, start0, stride0, start1, stride1);
+        } finally {
+            IDisposable closer = memoryReference as IDisposable;
+            if (closer != null) { try { closer.Dispose(); } catch { } }
+        }
+    }
     int ScreenColor(Bitmap bmp) {
         int sw = GetSystemMetrics(0), sh = GetSystemMetrics(1);
         using (Graphics g = Graphics.FromImage(bmp)) {
@@ -3012,35 +3081,51 @@ $CaptureWorker = {
         $src = $null
         foreach ($pair in $cap.FrameSources) { $s = $pair.Value; if ($s -and "$($s.Info.SourceKind)" -eq 'Color' -and (-not $src -or "$($s.Info.Id)" -eq "$($info.Id)")) { $src = $s } }
         if (-not $src) { throw 'the device has no picture stream' }
-        # The smallest uncompressed picture it offers is plenty for one colour. (Compressed ones - MJPG, H264 -
-        # can't be turned into plain pixels here; and when sharing the device the size can't be changed at all.)
-        $plain = @($src.SupportedFormats | Where-Object { "$($_.Subtype)" -match '^(YUY2|NV12|UYVY|RGB24|RGB32|ARGB32|I420|IYUV|YV12)$' })
+        # Leave the picture as the device is already sending it whenever that is a layout that can be read
+        # (other programs showing the same card keep their picture size). Only a compressed one (MJPG, H264)
+        # is switched, to a plain layout of the same size if there is one.
+        $readable = '^(YUY2|NV12|RGB32|ARGB32)$'
         $Sync.CapFormats = (@($src.SupportedFormats | ForEach-Object { "$($_.Subtype) $($_.VideoFormat.Width)x$($_.VideoFormat.Height)" } | Select-Object -Unique) -join ', ')
-        try {
-            $small = @($plain | Where-Object { $_.VideoFormat.Width -ge 320 } | Sort-Object { [int]$_.VideoFormat.Width * [int]$_.VideoFormat.Height } | Select-Object -First 1)
-            if ($small.Count) { AwaitAction ($src.SetFormatAsync($small[0])) }
-        } catch {}
-        $reader = Await ($cap.CreateFrameReaderAsync($src, [Windows.Media.MediaProperties.MediaEncodingSubtypes]::Bgra8)) ([Windows.Media.Capture.Frames.MediaFrameReader])
-        $started = Await ($reader.StartAsync()) ([Windows.Media.Capture.Frames.MediaFrameReaderStartStatus])
-        if ("$started" -ne 'Success') {
+        $cur = $src.CurrentFormat
+        if ("$($cur.Subtype)" -notmatch $readable) {
+            $plain = @($src.SupportedFormats | Where-Object { "$($_.Subtype)" -match $readable })
             if (-not $plain.Count) { throw 'it only sends compressed video, which can''t be read for colours' }
-            throw "the picture didn't start ($started; it is set to $($src.CurrentFormat.Subtype) $($src.CurrentFormat.VideoFormat.Width)x$($src.CurrentFormat.VideoFormat.Height))"
+            $cw = [int]$cur.VideoFormat.Width; $ch = [int]$cur.VideoFormat.Height
+            $pick = @($plain | Where-Object { [int]$_.VideoFormat.Width -eq $cw -and [int]$_.VideoFormat.Height -eq $ch } | Select-Object -First 1)
+            if (-not $pick.Count) { $pick = @($plain | Where-Object { [int]$_.VideoFormat.Width * [int]$_.VideoFormat.Height -le $cw * $ch } | Sort-Object { [int]$_.VideoFormat.Width * [int]$_.VideoFormat.Height } -Descending | Select-Object -First 1) }
+            if (-not $pick.Count) { $pick = @($plain | Sort-Object { [int]$_.VideoFormat.Width * [int]$_.VideoFormat.Height } | Select-Object -First 1) }
+            try { AwaitAction ($src.SetFormatAsync($pick[0])) }
+            catch { throw "it is sending $($cur.Subtype) video, which can't be read for colours, and that can't be changed while another program is using it" }
         }
+        # frames as they come, in the device's own layout: each layout is read as what it is
+        $reader = Await ($cap.CreateFrameReaderAsync($src)) ([Windows.Media.Capture.Frames.MediaFrameReader])
+        $started = Await ($reader.StartAsync()) ([Windows.Media.Capture.Frames.MediaFrameReaderStartStatus])
+        if ("$started" -ne 'Success') { throw "the picture didn't start ($started; it is set to $($src.CurrentFormat.Subtype) $($src.CurrentFormat.VideoFormat.Width)x$($src.CurrentFormat.VideoFormat.Height))" }
 
         $Sync.CapStatus = 'ok'
-        $buf = $null; $last = [datetime]::UtcNow
+        $last = [datetime]::UtcNow
+        $bgra = [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8
         while ($Sync.CapGen -eq $Gen) {
             $frame = $reader.TryAcquireLatestFrame()
             if ($frame) {
                 try {
                     $bmp = $frame.VideoMediaFrame.SoftwareBitmap
                     if ($bmp) {
-                        $w = [int]$bmp.PixelWidth; $h = [int]$bmp.PixelHeight; $need = 4 * $w * $h
-                        if (-not $buf -or $buf.Capacity -ne $need) { $buf = New-Object Windows.Storage.Streams.Buffer($need) }
-                        $bmp.CopyToBuffer($buf)
-                        $bytes = [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions]::ToArray($buf)
-                        $Rgb.Source = [RPRgb]::Average($bytes, $w, $h)
-                        $Sync.CapSize = "${w}x$h"; $last = [datetime]::UtcNow
+                        $use = $bmp; $made = $null
+                        $layout = "$($bmp.BitmapPixelFormat)"
+                        # a layout that isn't read directly is turned into BGRA by Windows first
+                        if ($layout -notin 'Bgra8', 'Nv12', 'Yuy2') { $made = [Windows.Graphics.Imaging.SoftwareBitmap]::Convert($bmp, $bgra); $use = $made; $layout = 'Bgra8' }
+                        $w = [int]$use.PixelWidth; $h = [int]$use.PixelHeight
+                        $lock = $use.LockBuffer([Windows.Graphics.Imaging.BitmapBufferAccessMode]::Read)
+                        try {
+                            $p0 = $lock.GetPlaneDescription(0)
+                            $s1 = 0; $st1 = 0
+                            if ($layout -eq 'Nv12') { $p1 = $lock.GetPlaneDescription(1); $s1 = [int]$p1.StartIndex; $st1 = [int]$p1.Stride }
+                            # AverageFrame lets go of the reference itself
+                            $c = [RPRgb]::AverageFrame($lock.CreateReference(), $layout, $w, $h, [int]$p0.StartIndex, [int]$p0.Stride, $s1, $st1)
+                            if ($c -ge 0) { $Rgb.Source = $c; $Sync.CapSize = "${w}x$h $layout"; $last = [datetime]::UtcNow }
+                        } finally { $lock.Dispose() }
+                        if ($made) { $made.Dispose() }
                         $bmp.Dispose()
                     }
                 } finally { $frame.Dispose() }

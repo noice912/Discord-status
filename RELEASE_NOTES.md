@@ -1,3 +1,22 @@
+## RichPresence 3.3.4
+
+### Fix: lights following a capture card came out green (Windows)
+In 3.3.3 the lights could follow a capture card, but the colour was wrong: mostly green, whatever was on
+the picture. Capture cards send video in a different layout from the one RichPresence was reading it as.
+Each layout is now read as what it is, so the lights get the picture's real colour.
+
+Also changed:
+- RichPresence no longer switches the capture card to a small picture size. It reads the picture as the
+  card is already sending it, so another program showing the same card keeps its full-size picture. Only a
+  card set to compressed video is switched, to plain video of the same size.
+- It uses less memory while following a card: frames are sampled where they are instead of being copied.
+
+How it was checked: on a USB HDMI capture card, the colour read from 44 different frames was compared with
+Windows' own conversion of the same frames and matched to within 1 part in 255. The lights themselves
+following it were not watched, so if the colour still looks off, please open an issue.
+
+Linux, Android and iPhone: no changes, only the version number.
+
 ## RichPresence 3.3.3
 
 ### Lights can follow a capture card (Windows)
